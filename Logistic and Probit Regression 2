@@ -109,7 +109,7 @@ quit;
 *
 *********************************************************;
 
-%macro SCORE( INFILE, OUTFILE );
+%macro SCORE( INFILE, OUTFILE ); 
 
 data &OUTFILE.;
 set &INFILE.;
