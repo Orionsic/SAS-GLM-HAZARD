@@ -1,0 +1,300 @@
+libname mydata '/folders/myfolders/sasuser.v94/Module 3';
+
+%macro SCORE(INFILE, OUTFILE) ;
+data &OUTFILE. ;
+set mydata.&INFILE.;
+run;
+
+*********************************************************
+Variable Macros
+*********************************************************;
+
+*Original variables;
+%let first_inputs=acidindex alcohol chlorides citricacid density 
+fixedacidity freesulfurdioxide labelappeal residualsugar stars
+sulphates target totalsulfurdioxide volatileacidity ph;
+
+proc means data=&OUTFILE.(drop=INDEX) n nmiss p10 p25 mean median p75 p90 var min max ndec=3;
+var &first_inputs; run;
+
+*Comparing first imputed variables with originals;
+%let second_inputs= IMP_ABS_citricacid IMP_ABS_volatileacidity IMP_ABS_fixedacidity
+IMP_ABS_totalsulfurdioxide IMP_ABS_sulphates IMP_ABS_residualsugar IMP_ABS_freesulfurdioxide
+IMP_ABS_chlorides IMP_ABS_alcohol imp_ph imp_stars labelappeal acidindex ;
+
+********************************************************
+EDA
+*********************************************************;
+
+proc contents data=wine;
+run;
+proc means data=wine(drop=INDEX) n nmiss p10 p25 mean median p75 p90 var min max ndec=0;
+run;
+
+proc sgplot data=wine;
+  vbox  imp_stars  /group=target;
+  xaxis label="Wine Sales";
+  keylegend / title="BoxPlot";
+run;
+
+ods graphics on;
+Title1 "Negative Binomial Distributions";
+proc ttest data = wine ;
+	var fixedacidity totalsulfurdioxide volatileacidity imp_stars;
+	run;
+	ods graphics off;
+
+proc means data = wine n nmiss; 
+var alcohol chlorides freesulfurdioxide residentialsugar stars sulphates totalsulfurdioxide ph; run;
+
+proc means data = wine n nmiss mean var min max;
+var alcohol imp_alcohol chlorides imp_abs_chlorides freesulfurdioxide imp_abs_freesulfurdioxide 
+residualsugar imp_abs_residualsugar stars imp_stars sulphates imp_abs_sulphates 
+totalsulfurdioxide imp_abs_totalsulfurdioxide ph imp_ph; run;
+
+proc means  data = wine n nmiss ; 
+var alcohol imp_alcohol chlorides imp_abs_chlorides freesulfurdioxide imp_abs_freesulfurdioxide 
+residualsugar imp_abs_residualsugar stars imp_stars sulphates imp_abs_sulphates 
+totalsulfurdioxide imp_abs_totalsulfurdioxide ph imp_ph; run;
+
+proc corr data= wine;
+var target imp_stars labelappeal imp_abs_totalsulfurdioxide acidindex; run;
+ 
+ods graphics on;
+proc freq data = wine ; 
+tables TARGET * IMP_Stars / norow chisq plots = mosaicplot;
+title 'Wines that sell more can have higher ratings';
+run; ods graphics off;
+
+ods graphics on;
+proc freq data = wine ; 
+tables AcidIndex * Target / norow chisq plots = mosaicplot;
+title 'Wines with higher acidity are not as popular and typically sell less in volume';
+run; ods graphics off;
+
+proc sgplot data=wine;
+   hbar target / ;
+run;
+
+*Overdispersion;
+ods noproctitle;
+ods graphics / imagemap=on;
+
+proc sort data=wine out=histogramtest;
+	by TARGET;
+run;
+
+proc means data=histogramtest chartype mean var max median n nmiss range vardef=df clm alpha=0.05 
+	qmethod=os;
+	var IMP_stars IMP_ABS_freesulfurdioxide IMP_ABS_residualsugar IMP_ABS_Alcohol IMP_ABS_fixedacidity IMP_ABS_citricacid IMP_ABS_totalsulfurdioxide;
+	class imp_stars;
+	by TARGET;
+run;
+
+proc univariate data=histogramtest vardef=df noprint;
+	var IMP_stars IMP_ABS_freesulfurdioxide IMP_ABS_residualsugar IMP_ABS_Alcohol 
+	IMP_ABS_fixedacidity IMP_ABS_citricacid IMP_ABS_totalsulfurdioxide;
+	class imp_stars;
+	histogram IMP_stars IMP_ABS_freesulfurdioxide IMP_ABS_residualsugar IMP_ABS_Alcohol
+    IMP_ABS_fixedacidity IMP_ABS_citricacid IMP_ABS_totalsulfurdioxide / normal(noprint) kernel;
+	inset mean var max median n nmiss range  / position=ne;
+	by TARGET;
+run; ods graphics off;
+
+*zero inflated variables;
+ods noproctitle;
+ods graphics / imagemap=on;
+
+proc sort data=wine out=histogramtest1;
+	by TARGET;
+run;
+
+proc means data=histogramtest1 chartype mean var max median n nmiss range vardef=df clm alpha=0.05 
+	qmethod=os;
+	var IMP_ABS_chlorides imp_abs_sulphates IMP_ABS_volatileacidity imp_abs_citricacid;
+	class imp_stars;
+	by TARGET;
+run;
+
+proc univariate data=histogramtest1 vardef=df noprint;
+	var IMP_ABS_chlorides imp_abs_sulphates IMP_ABS_volatileacidity imp_abs_citricacid;
+	class imp_stars;
+	histogram imp_abs_chlorides imp_abs_sulphates IMP_ABS_volatileacidity imp_abs_citricacid / normal(noprint) kernel;
+	inset mean var max median n nmiss range  / position=ne;
+	by TARGET;
+run; ods graphics off;
+
+*********************************************************
+TRAINING DATA
+*********************************************************;
+data &OUTFILE. ;
+ set &OUTFILE. ;
+	*Uses mean;
+	IMP_residualsugar = residualsugar;
+	M_residualsugar = 0;
+	if missing(residualsugar) then do;
+	IMP_residualsugar = 5.41873;
+	M_residualsugar = 1;
+end; 
+	*all values zero;
+	IMP_chlorides = chlorides;
+	M_chlorides = 0;
+	if missing(chlorides) or chlorides = 0 then do;
+	IMP_chlorides = 0;
+	M_chlorides = 1;
+end; 
+	*Uses mean;
+	IMP_freesulfurdioxide= freesulfurdioxide;
+	M_freesulfurdioxide= 0;
+	if missing(freesulfurdioxide) then do;
+	IMP_freesulfurdioxide= 30.84557;
+	M_freesulfurdioxide= 1; 
+end; 
+	*Uses Median;
+	IMP_totalsulfurdioxide = totalsulfurdioxide;
+	M_totalsulfurdioxide = 0;
+	if missing(totalsulfurdioxide) then do;
+	IMP_totalsulfurdioxide = 123;
+	M_totalsulfurdioxide = 1;
+end; 
+	*Uses mean;
+	IMP_ph = ph;
+	M_ph = 0;
+	if missing(ph) then do;
+	IMP_ph = 3.20763;
+	M_ph = 1;
+end; 
+	*Uses mean;
+	IMP_sulphates = sulphates;
+	M_sulphates = 0;
+	if missing(sulphates) then do;
+	IMP_sulphates = 0.52711;
+	M_sulphates = 1;
+end;
+	*Uses median;
+	IMP_alcohol = alcohol;
+	M_alcohol = 0;
+	if missing(alcohol) then do;
+	IMP_alcohol = 10.48924;
+	M_alcohol = 1;
+end;
+*Non-rated wines;
+	IMP_STARS = Stars;
+	M_Stars = 0;
+	if missing(stars) then do;
+	IMP_Stars = 0;
+	M_Stars = 1;
+end;
+
+*Absolute value transformation with imputted means/medians if necessary;
+IMP_ABS_alcohol = abs(imp_alcohol);
+IMP_ABS_chlorides = abs(imp_chlorides);
+IMP_ABS_freesulfurdioxide = abs(imp_freesulfurdioxide);
+IMP_ABS_residualsugar = abs(imp_residualsugar);
+IMP_ABS_sulphates = abs(imp_sulphates);
+IMP_ABS_totalsulfurdioxide = abs(imp_totalsulfurdioxide);
+IMP_ABS_fixedacidity = abs(fixedacidity);
+IMP_ABS_volatileacidity = abs(volatileacidity);
+IMP_ABS_citricacid = abs(citricacid);
+
+*log transformations after ABS;
+IMP_LOG_alcohol = LOG(IMP_ABS_alcohol);
+IMP_LOG_chlorides = LOG(IMP_ABS_chlorides);
+IMP_LOG_freesulfurdioxide = LOG(IMP_ABS_freesulfurdioxide);
+IMP_LOG_residualsugar = LOG(IMP_ABS_residualsugar);
+IMP_LOG_sulphates = LOG(IMP_ABS_sulphates);
+IMP_LOG_totalsulfurdioxide = LOG(IMP_ABS_totalsulfurdioxide);
+IMP_LOG_fixedacidity = LOG(IMP_ABS_fixedacidity);
+IMP_LOG_volatileacidity = LOG(IMP_ABS_volatileacidity);
+IMP_LOG_citricacid = LOG(IMP_ABS_citricacid);
+
+
+*********************************************************
+TRAINING LOGIT AND OLS MODELS
+*********************************************************;
+
+*ML Regression model;
+proc reg data=&OUTFILE. outest = regmodel;
+model TARGET = IMP_STARS LABELAPPEAL IMP_ABS_TOTALSULFURDIOXIDE
+IMP_ABS_VOLATILEACIDITY IMP_CHLORIDES 
+	/ aic bic mse cp vif; run; 
+
+*Poisson Regression;
+ods graphics on;
+title "Poisson Regression";
+proc genmod data=&OUTFILE.;
+   model TARGET = IMP_STARS LABELAPPEAL IMP_ABS_TOTALSULFURDIOXIDE
+IMP_ABS_VOLATILEACIDITY IMP_CHLORIDES / dist=poisson link=log ;
+   store out=poimodel;
+run; ods graphics off;
+
+*negative binomial model;
+proc genmod data=&OUTFILE.;
+   class imp_stars labelappeal;
+   model target=  IMP_STARS LABELAPPEAL IMP_ABS_TOTALSULFURDIOXIDE
+IMP_ABS_VOLATILEACIDITY IMP_CHLORIDES imp_abs_fixedacidity imp_abs_sulphates
+       / dist=nb link=log d=p scale=p;
+   store out=nbmodel;
+run;
+
+*Zero-Inflated Poisson model;
+proc genmod data=&OUTFILE.;
+   class labelappeal imp_stars  ;
+   model target=  IMP_STARS LABELAPPEAL IMP_ABS_TOTALSULFURDIOXIDE
+IMP_ABS_VOLATILEACIDITY IMP_CHLORIDES imp_abs_fixedacidity imp_abs_sulphates 
+imp_abs_citricacid imp_abs_alcohol / dist=zip link=log ;
+   zeromodel labelappeal /link=logit;    
+   store out=zipmodel;
+run;
+
+*Zero-Inflated Negative Bionomial model;
+proc genmod data=&OUTFILE.;
+   class labelappeal   ;
+   model target= IMP_STARS LABELAPPEAL IMP_ABS_TOTALSULFURDIOXIDE
+IMP_ABS_VOLATILEACIDITY IMP_CHLORIDES imp_abs_fixedacidity imp_abs_sulphates 
+imp_abs_citricacid imp_abs_alcohol / dist=zinb link=log; 
+   zeromodel labelappeal /link=logit;
+   store out=zinbmodel;
+
+*********************************************************
+SCORE THE MODELS
+*********************************************************;
+data winetest;
+		set &OUTFILE.;
+		
+   p_target = 1.8564	
++	-1.0984	* (	IMP_STARS	in (	0	))
++	-0.3866	* (	IMP_STARS	in (	1	))
++	-0.2046	* (	IMP_STARS	in (	2	))
++	-0.1077	* (	IMP_STARS	in (	3	))
++	-0.8885	* (	LabelAppeal	in (	-2	))
++	-0.5793	* (	LabelAppeal	in (	-1	))
++	-0.3302	* (	LabelAppeal	in (	0	))
++	-0.1634	* (	LabelAppeal	in (	1	))
++	-0.0309	*	IMP_ABS_VOLATILEACIDITY	
++	-0.0377	*	IMP_chlorides	
++	0.0062	*	IMP_ABS_alcohol;
+   P_SCORE_ZIP_ALL = exp(TEMP);
+   P_TARGET = P_SCORE_ZIP_ALL * (1 - P_SCORE_ZERO);
+   P_TARGET_ROUND = round(P_TARGET,1);
+
+keep index P_TARGET TARGET P_TARGET_ROUND;
+run; 
+
+
+****************************************************
+MERGE FILES
+*********************************************************;
+proc sort data = winetest; by index; run;
+
+data mydata.NewFile;
+set winetest;
+run;
+quit;
+%mend;
+
+%SCORE (wine, wine);
+* %SCORE (wine_test, wine);
+
+
+
