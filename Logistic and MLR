@@ -1,0 +1,286 @@
+libname mydata '/folders/myfolders/sasuser.v94/Module 2/Insurance Assignment';
+
+data insurance;
+set mydata.logit_insurance;
+run;
+
+*********************************************************
+TRAINING DATA
+*********************************************************;
+data one;
+ set insurance;
+	IMP_Car_age = car_age;
+	M_car_age = 0;
+	if missing(car_age) then do;
+	IMP_car_age = 8;
+	M_car_age = 1;
+end; 
+	IMP_home_val = home_val;
+	M_home_val = 0;
+	if missing(home_val) or home_val = 0 then do;
+	IMP_home_val = 161160;
+	M_home_val = 1;
+end; 
+	IMP_income = income;
+	M_income = 0;
+	if missing(income) then do;
+	IMP_income = 54028;
+	M_income = 1; 
+end; 
+	IMP_job = job;
+	M_job = 0;
+	if missing(job) then do;
+	IMP_job = "z_Blue Collar";
+	M_job = 1;
+end; 
+	IMP_yoj = yoj;
+	M_yoj = 0;
+	if missing(yoj) then do;
+	IMP_yoj = 11;
+	M_yoj = 1;
+end; 
+	IMP_BLUEBOOK = BLUEBOOK;
+	M_BLUEBOOK = 0;
+	if BLUEBOOK = 0 then do;
+	IMP_BLUEBOOK = 14440;
+	M_BLUEBOOK = 1;
+end;
+IMP_LOG_INCOME=LOG(IMP_INCOME);
+IMP_LOG_HOME_VAL=LOG(IMP_HOME_VAL);
+IMP_LOG_BLUEBOOK = LOG(IMP_BLUEBOOK);
+
+*********************************************************
+TEST DATA
+*********************************************************;
+data testdata;
+ set mydata.logit_insurance_test;
+	IMP_Car_age = car_age;
+	M_car_age = 0;
+	if missing(car_age) then do;
+	IMP_car_age = 8;
+	M_car_age = 1;
+end; 
+	IMP_home_val = home_val;
+	M_home_val = 0;
+	if missing(home_val) or home_val = 0 then do;
+	IMP_home_val = 161160;
+	M_home_val = 1;
+end; 
+	IMP_income = income;
+	M_income = 0;
+	if missing(income) then do;
+	IMP_income = 54028;
+	M_income = 1; 
+end; 
+	IMP_job = job;
+	M_job = 0;
+	if missing(job) then do;
+	IMP_job = "z_Blue Collar";
+	M_job = 1;
+end; 
+	IMP_yoj = yoj;
+	M_yoj = 0;
+	if missing(yoj) then do;
+	IMP_yoj = 11;
+	M_yoj = 1;
+end; 
+	IMP_BLUEBOOK = BLUEBOOK;
+	M_BLUEBOOK = 0;
+	if BLUEBOOK = 0 then do;
+	IMP_BLUEBOOK = 14440;
+	M_BLUEBOOK = 1;
+end;
+
+IMP_LOG_INCOME=LOG(IMP_INCOME);
+IMP_LOG_HOME_VAL=LOG(IMP_HOME_VAL);
+IMP_LOG_BLUEBOOK = LOG(IMP_BLUEBOOK);
+
+*********************************************************
+CREATE MODELS AND UPLIFT GRAPHS
+*********************************************************;
+
+%macro Uplift(INFILE);
+
+proc rank data=&INFILE. out=testscore descending groups=10;
+var p;
+ranks score_decile;
+run;
+
+proc means data=testscore mean;
+class score_decile;
+var target_flag;
+output out=pm_out sum(target_flag)=Y_Sum;
+run;
+
+proc print data=pm_out; run;
+
+data lift_chart;
+	set pm_out (where=(_type_=1));
+	by _type_;
+	Nobs=_freq_;
+	score_decile = score_decile+1;
+	
+	if first._type_ then do;
+		cum_obs=Nobs;
+		model_pred=Y_Sum;
+	end;
+	else do;
+		cum_obs=cum_obs+Nobs;
+		model_pred=model_pred+Y_Sum;
+	end;
+	retain cum_obs model_pred;
+	
+	* 2148 represents the number of successes; 
+	* This value will need to be changed with different samples;
+	pred_rate=model_pred/2148; 
+	base_rate=score_decile*0.1;
+	lift = pred_rate-base_rate;
+	
+	drop _freq_ _type_ ;
+run;
+
+proc print data=lift_chart; run;
+
+title 'My Lift Chart';
+proc sgplot data=lift_chart;
+   series x=base_rate y=base_rate;
+   series x=base_rate y=pred_rate;
+run;
+
+*///Univ Ed will not do proc gplot///; 
+title 'Orions Lift Chart';
+ 
+proc sgplot data=lift_chart;
+   series x=base_rate y=base_rate;
+   series x=base_rate y=pred_rate;
+run;    
+
+%mend; 
+
+*First logit model;
+proc logistic data=one plots(only)=roc;
+class urbanicity (param=ref);
+model target_flag(event='1')=urbanicity imp_log_bluebook 
+income clm_freq mvr_pts; output out=firstM p=p l=l u=u predprobs=I; run; 
+%Uplift (FirstM);
+*Second logit model;
+proc logistic data=one plots(only)=roc;
+class urbanicity (param=ref) car_type (param=ref);
+model target_flag(event='1')=urbanicity imp_log_bluebook 
+income clm_freq mvr_pts home_val car_type; output out=SecondM p=p l=l u=u predprobs=I; run; 
+%Uplift (SecondM);
+*Third logit model;
+proc logistic data=one outmodel=insmodel lots(only)=roc;
+class urbanicity (param=ref) car_use (param=ref) parent1 (param=ref) education (param=ref) car_type (param=ref);
+model target_flag(event='1')= urbanicity imp_log_bluebook 
+income clm_freq mvr_pts home_val tif car_use; output out=ThirdM p=p l=l u=u predprobs=I; run;
+%Uplift (ThirdM);
+*Fourth logit model;
+proc logistic data=one outmodel=insmodel lots(only)=roc;
+class urbanicity (param=ref) car_use (param=ref) parent1 (param=ref) education (param=ref) car_type (param=ref);
+model target_flag(event='1')= urbanicity imp_log_bluebook income 
+clm_freq mvr_pts home_val tif car_use parent1 education car_type; output out=FourthM p=p l=l u=u predprobs=I; run; 
+%Uplift (FourthM);
+
+*********************************************************
+TRAINING LOGIT AND OLS MODELS
+*********************************************************;
+
+proc logistic data=one outmodel=insmodel lots(only)=roc;
+class urbanicity (param=ref) car_use (param=ref) parent1 (param=ref) 
+education (param=ref) car_type (param=ref);
+model target_flag(event='1')= urbanicity imp_log_bluebook income 
+clm_freq mvr_pts home_val tif car_use parent1 education car_type; 
+run;
+
+proc reg data=one;
+model target_amt =KIDSDRIV AGE HOMEKIDS INCOME TIf OLDCLAIM CLM_FREQ CAR_AGE;
+run;
+
+*********************************************************
+SCORE THE MODELS - TARGET FLAG AND AMOUNT
+*********************************************************;
+proc logistic inmodel=insmodel;
+   score data=testdata out=testscore;
+run;
+*///create the file in a saved library for your results///;
+data mydata.demo_ins_prob;
+   set testscore;
+   Logit1 = 1.3638
++ 2.1683 * (URBANICITY IN ("<Highly URBAN/URBAN"))
+-0.3176 * IMP_LOG_BLUEBOOK 
+-2.83E-06 * IMP_INCOME 
++ 0.1558 * CLM_FREQ 
++ 0.1124 * MVR_PTS 
+-2.13E-06 * HOME_VAL 
+-0.0543* TIF 
++ 0.8481 * (CAR_USE IN ("Commercial"))
+-0.8320* (PARENT1 IN ("no"))
+-0.4583 * (EDUCATION IN ("Bachelors"))
+-0.4972 * (EDUCATION IN ("Masters"))
+-0.5247 * (EDUCATION IN ("PhD"))
+-0.4972 * (EDUCATION IN ("Masters"))
+-0.2903 * (CAR_TYPE IN  ("Pickup"))
+-0.7723 * (CAR_TYPE IN ("MINIVAN"));
+odds = exp(logit1);
+p_target_flag = odds/(odds+1);
+   keep index p_target_flag;
+   if missing(p_target_flag) then do;
+	p_target_flag = 0.1280996;  end;
+proc print;
+run;
+
+*///part of your assignment is to build another model here for p_target_amt///;
+data mydata.demo_ins_amt;
+   set testscore;
+   P_Target_amt = 1680.10784
++ 254.96373 * KIDSDRIV 
++ 164.96373 * HOMEKIDS 
+- 0.00265 * INCOME 
+- 51.07760 * TIF 
++ 471.03286 * CLM_FREQ 
+- 32.44980 * CAR_AGE;
+   keep index p_target_amt;
+	if missing(p_target_amt) then do;
+	p_target_amt = 1530.90;end;
+run; proc print; run;
+
+*********************************************************
+MERGE FILES
+*********************************************************;
+proc sort data = mydata.demo_ins_amt; by index; run;
+proc sort data = mydata.demo_ins_prob;by index; run;
+
+data Score;
+merge mydata.demo_ins_prob(in=ina) mydata.demo_ins_amt(in=inb);
+by INDEX;
+if ina;
+run;
+
+libname mydata '/folders/myfolders/sasuser.v94/Module 2/Insurance Assignment';
+data NewFile;
+set Score;
+run;
+
+*********************************************************
+BONUS
+*********************************************************;
+proc logistic data=one ;
+class urbanicity (param=ref) car_use (param=ref) parent1 (param=ref) 
+education (param=ref) car_type (param=ref);
+model target_flag(event='1')= urbanicity imp_log_bluebook income 
+clm_freq mvr_pts home_val tif car_use parent1 education car_type / link=probit stb; 
+run;
+
+proc genmod data= one;
+class urbanicity (param=ref) car_use (param=ref) parent1 (param=ref) 
+education (param=ref) car_type (param=ref);
+model target_flag(event='1')= urbanicity imp_log_bluebook income 
+clm_freq mvr_pts home_val tif car_use parent1 education car_type / dist = bin link = logit lrci; run;
+
+proc logistic data=one outmodel=insmodel plots(only)=roc;
+class urbanicity (param=ref) car_use (param=ref) parent1 (param=ref) 
+education (param=ref) car_type (param=ref);
+model target_flag(event='1')= urbanicity imp_log_bluebook income 
+clm_freq mvr_pts home_val tif car_use parent1 education car_type; 
+run;
