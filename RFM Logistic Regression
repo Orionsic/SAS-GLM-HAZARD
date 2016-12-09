@@ -1,0 +1,507 @@
+/* ///////////////////////////////////////////////////////////////////////// */
+/* ///////////////////////////////////////////////////////////////////////// */
+/* ///////////////////////////////////////////////////////////////////////// */
+/* ///////////////////////////////////////////////////////////////////////// */
+/* ///////////////////////////////////////////////////////////////////////// */
+/* ///////////////////////////////////////////////////////////////////////// */
+/* ///////////////////////////////////////////////////////////////////////// */
+
+TITLE "PREDICT 410-55: Building and Testing an RFM Logistic Regression Model";
+
+/* RFM stands for recency, frequency, and monetary value.
+   
+   Recency refers to how recently the customer purchased an item.
+   Frequency refers to how often the customer purchases.
+   Monetary value refers to how much the customer spends.
+   
+   Regarding monetary value, we might consider the average spend
+   on an order or the total spend across time, or both.         */
+   
+ODS GRAPHICS ON; * to get high resolution graphics output from selected PROCs;
+OPTIONS OBS = MAX; * reset option to analyze and report on all data;
+
+* Read in the demographics data without header row;
+FILENAME demo '/courses/u_northwestern.edu1/i_810095/c_3190/predict410_session1_demodat.csv'; 
+DATA demodat;
+INFILE demo DSD;
+INPUT INDIVIDUAL_ID MED_INC MED_HOME_VALUE MED_RENT MED_LENGTH_OF_RESIDENCE
+NUM_CHILD NUMB_ADLT ADVERTISING AVG_NO_OF_BANK_ACCNT OWN_HOME LOR MARRIAGE_STATUS
+INTESTEST_IN_SPORT INTEREST_IN_DIY INTEREST_IN_TRAVEL GENDER $ AGE;
+DATALINES;
+ ...
+RUN;
+
+* Read in the sales data without header row and with dates as character strings;
+FILENAME sales '/courses/u_northwestern.edu1/i_810095/c_3190/predict410_session1_salesdat.csv'; 
+DATA salesdat;
+INFILE sales DSD;
+INPUT INDIVIDUAL_ID LTD_GROSS_NUM_ORDERS LTD_GROSS_PURCHASE_AMT LTD_GROSS_PURCHASE_UNITS
+ LTD_AVG_ORDER_AMT LTD_AVG_ORDER_UNITS FIRST_PURCHASE_DATE $ FIRST_PURCHASE_AMT      
+ LAST_PURCHASE_DATE $ LAST_PURCHASE_AMT CLOSEST_STORE_DISTANCE RETAIL_DOLLARS          
+ RETAIL_ORDERS DIRECT_DOLLARS DIRECT_ORDERS GROSS_SELL_AMT GROSS_QTY RESP_IND;
+ DATALINES;
+ ...
+RUN;
+ 
+PROC SORT DATA=demodat OUT=demosrt; BY INDIVIDUAL_ID;
+PROC SORT DATA=salesdat OUT=salessrt; BY INDIVIDUAL_ID;
+
+* Merge the demographics and sales data;
+DATA alldat;
+MERGE demosrt salessrt;
+BY INDIVIDUAL_ID;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+* Delete observations lacking critical date;
+* or lifetime purchase information;
+* as needed for RFM model;
+* There are not very many of these;
+DATA alldat;
+SET alldat;
+IF LAST_PURCHASE_DATE = '' THEN DELETE;
+IF FIRST_PURCHASE_DATE = '' THEN DELETE;
+
+* --------- THIS IS THE M IN RFM ---------;
+IF LTD_AVG_ORDER_AMT = . THEN DELETE; * Monetary value type one;
+IF LTD_GROSS_PURCHASE_AMT = . THEN DELETE; * Monetary value type two;
+
+* --------- IF THE BINARY RESPONSE IS MISSING THEN DELETE -------;
+IF RESP_IND = . THEN DELETE; 
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+* clone response variables;
+* replace missing sales response data with zeroes;
+* and create new gender and date variables;
+DATA alldat;
+SET alldat;
+GROSS_SALES_AMT = GROSS_SELL_AMT;
+IF GROSS_SALES_AMT = . THEN GROSS_SALES_AMT = 0; 
+
+* log sales as possible response;
+LOG_GROSS_SALES_AMT = LOG(GROSS_SALES_AMT + 1); 
+
+GROSS_QUANTITY = GROSS_QTY;
+IF GROSS_QUANTITY = . THEN GROSS_QUANTITY = 0; 
+
+* Add code U for undefined to GENDER;
+IF GENDER ^in('M','F') THEN GENDER='U';
+
+* Define MALE as binary indicator variable;
+IF GENDER ='M' THEN MALE=1; ELSE MALE=0;
+
+* Define FEMALE as binary indicator variable;
+IF GENDER ='F' THEN FEMALE=1; ELSE FEMALE=0;
+
+* Create date variables for subsequent analysis;
+* Character to date format;
+XLAST_PURCHASE_DATE = input(LAST_PURCHASE_DATE, mmddyy10.); 
+
+* Character to date format;
+XFIRST_PURCHASE_DATE = input(FIRST_PURCHASE_DATE, mmddyy10.); 
+
+* WORKING THE DATES ---------------------------------------------------;
+* Note that we had previously used TODAY() as a base date for computing;
+* date-defined variables like XDAYS_SINCE_LAST_PURCHASE and;
+* XDAYS_SINCE_FIRST_PURCHASE (tenure)....;
+* But TODAY() means today's date, which changes every day;
+* To provide code that yields results that are reproducible;
+* from one run to the next, we will use an imagined day of;
+* the promotion to provide the date baseline for date variables;
+* That way results will be consistent across time;
+* The idea of reproducibility of runs is one we have employed;
+* previously in setting random number generator seed values;
+* Note the following date ranges in the sample data;
+
+* A review of the sample data shows that;
+* FIRST_PURCHASE_DATE goes from 1/1/00 to 6/6/10;
+* LAST_PURCHASE_DATE goes from 8/16/03 to 12/13/10;
+
+* In the code that follows for date calculations;
+* we arbitrarily set 12/14/10 as our date for the promotion;
+* Here we define the constant variable DATE_OF_PROMOTION;
+DATE_OF_PROMOTION = '12/14/10'; * arbitrary date constant as character string;
+XDATE_OF_PROMOTION = input(DATE_OF_PROMOTION, mmddyy10.); * set character string as date type;
+
+* --------- COMPUTE THE R IN RFM ---------;
+XDAYS_SINCE_LAST_PURCHASE = XDATE_OF_PROMOTION - XLAST_PURCHASE_DATE; * Recency Variable;   
+
+* --------- COMPUTE THE F IN RFM ---------;
+XDAYS_BETWEEN_FIRST_AND_LAST = (XLAST_PURCHASE_DATE - XFIRST_PURCHASE_DATE);
+XDAYS_BETWEEN_ORDERS = XDAYS_BETWEEN_FIRST_AND_LAST/LTD_GROSS_NUM_ORDERS; * Frequency Variable;
+
+* --------- TWO POSSIBLE TENURE VARIABLES (PICK YOUR POISON) -------;
+* One tenure-related variable is the days since first purchase; 
+* This can be used in predictive models for sales response or;
+* binary response to the promtion;
+* Here we are assuming that all of the customers in our sample data;
+* are still our customers...  whether or not they responded to the promotion;
+XDAYS_SINCE_FIRST_PURCHASE = XDATE_OF_PROMOTION - XFIRST_PURCHASE_DATE; 
+
+* Another tenure-related variable would consider the promotion response;
+* Here if someone has not responded to the promotion we consider;
+* the date of the last purchase as the the last purchase date;
+* That is, we do not assume that all of the customers in our sample data;
+* are still our customers...  if they responded to the promotion they are;
+* but if they did not respond to the promotion, we do not know;
+* if they are still our customers;
+* Note that this tenure variable cannot be used in predictive models;
+* for sales response or for binary response to the promotion;
+* because it is defined using the binary response RESP_IND itself; 
+YDAYS_SINCE_FIRST_PURCHASE = XDATE_OF_PROMOTION - XFIRST_PURCHASE_DATE;
+IF(RESP_IND = 0) THEN YDAYS_SINCE_FIRST_PURCHASE = XLAST_PURCHASE_DATE - XFIRST_PURCHASE_DATE;
+RUN;
+
+
+* print first 20 observations to check values of selected date variables;
+* we look at the character strings and the computed numeric date variables;
+TITLE2 "Character and Numeric Date Variables across the Entire Sample";
+OPTIONS OBS = 20;
+PROC PRINT DATA = alldat; 
+VAR INDIVIDUAL_ID RESP_IND FIRST_PURCHASE_DATE LAST_PURCHASE_DATE DATE_OF_PROMOTION
+XFIRST_PURCHASE_DATE XLAST_PURCHASE_DATE XDATE_OF_PROMOTION;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+* print first 20 observations to check values of calculated date variables;
+* we look at the character strings and the computed numeric date variables;
+TITLE2 "Numeric Computed Date Variables across the Entire Sample";
+OPTIONS OBS = 20;
+PROC PRINT DATA = alldat; 
+VAR INDIVIDUAL_ID RESP_IND XFIRST_PURCHASE_DATE XLAST_PURCHASE_DATE XDATE_OF_PROMOTION
+XDAYS_SINCE_LAST_PURCHASE XDAYS_SINCE_FIRST_PURCHASE YDAYS_SINCE_FIRST_PURCHASE;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+* print first 20 observations to check values of calculated date variables;
+* we look at the character strings and the computed numeric date variables;
+TITLE2 "Numeric Computed Frequency Variable across the Entire Sample";
+OPTIONS OBS = 20;
+PROC PRINT DATA = alldat; 
+VAR INDIVIDUAL_ID RESP_IND XFIRST_PURCHASE_DATE XLAST_PURCHASE_DATE XDAYS_BETWEEN_FIRST_AND_LAST LTD_GROSS_NUM_ORDERS XDAYS_BETWEEN_ORDERS;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+* Define set of explanatory variables for use in multiple imputation;
+* Though not needed for the RFM model many of these may be useful later;
+* In developing survival models for tenure, for example, we may want to;
+* use demographic variables that have lots of missing data;
+* We include INTESTEST_IN_SPORT, INTEREST_IN_DIY, and INTEREST_IN_TRAVEL;
+* in our list, thinking that these are obtainded from surveys;
+* and are not generated from lifetime order data;
+%let EXPLANATORY_VARIABLES =
+MED_INC 
+MED_HOME_VALUE 
+MED_RENT 
+MED_LENGTH_OF_RESIDENCE
+NUM_CHILD 
+NUMB_ADLT  
+AVG_NO_OF_BANK_ACCNT 
+OWN_HOME 
+LOR 
+MARRIAGE_STATUS
+INTESTEST_IN_SPORT 
+INTEREST_IN_DIY 
+INTEREST_IN_TRAVEL 
+AGE
+MALE
+FEMALE;
+
+/* Note that we have excluded date and lifetime order variables from
+   our multiple imputation list, thinking that these are related
+   in the calculation of tenure variables, which are the possible
+   response variables in subsequent survival data models.
+   Variables omitted from the multiple imputation list this time around:
+
+LTD_GROSS_NUM_ORDERS 
+LTD_GROSS_PURCHASE_AMT 
+LTD_GROSS_PURCHASE_UNITS
+LTD_AVG_ORDER_AMT 
+LTD_AVG_ORDER_UNITS  
+FIRST_PURCHASE_AMT      
+LAST_PURCHASE_AMT 
+CLOSEST_STORE_DISTANCE 
+RETAIL_DOLLARS          
+RETAIL_ORDERS DIRECT_DOLLARS 
+DIRECT_ORDERS;
+XLAST_PURCHASE_DATE
+XFIRST_PURCHASE_DATE
+XDAYS_SINCE_LAST_PURCHASE
+XDAYS_SINCE_FIRST_PURCHASE
+XDAYS_BETWEEN_ORDERS 
+
+ADVERTISING ... not sure about this variable... but it could
+be that this has been defined in terms of responses to past promotions
+which is lifetime-order-data related....    
+*/
+
+
+* Multiple imputation across the explanatory variable set;
+* If there are missing data on any of these variables;
+* replacement data values will be obtained from a;
+* multiple regression model utilizing all other variables;
+* Documentation for SAS multiple imputation may be found at;
+*  http://support.sas.com/rnd/app/papers/multipleimputation.pdf ;
+* Setting the seed ensures reproducibility of results from;
+*   one run of this program to the next;
+TITLE2 "Multiple Imputations Constructed for Possible Future Use";
+PROC MI DATA = alldat seed=77777 out = midat;
+MCMC;
+VAR &EXPLANATORY_VARIABLES.;
+run;
+
+* show contents of the full data set prior to splitting;
+TITLE2 "Contents of the Multiple Imputation Data Set (5 Imputations)";
+PROC CONTENTS DATA = midat;
+RUN;
+
+/* For our learning and test set work we choose just one of the five
+   instances of the multiple imputation dataset.
+   If this were a full study involving any of the explanatory
+   variables for which missing data were replaced by multiple
+   imputations, then we would repeat this analysis five times.    */
+DATA fulldat1;
+SET midat;
+IF(_Imputation_ ^= 1) THEN DELETE;
+RUN;
+
+* show contents of the full data set prior to splitting;
+TITLE2 "Contents of the Selected Imputation for Analysis";
+PROC CONTENTS DATA = fulldat1;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+TITLE2 "Prepare for Dividing SAS Dataset into Learning and Test Subsamples";
+* here we use PROC SURVEYSELECT to split the data into two subsamples;
+* simple random sampling without replacement;
+* splits full dataset into two with 6500 in learning set;
+* Setting the seed ensures reproducibility of results from;
+*   one run of this program to the next;
+* specify that all original observations will be included in splitdat;
+PROC SURVEYSELECT DATA = fulldat1
+METHOD = SRS 
+N = 5000 
+SEED = 77777 
+OUT = splitdat 
+OUTALL; 
+RUN;
+
+* let learning set be SELECTED = 1;
+* let test set be SELECTED = 0;
+* define test data set as having missing values;
+* new response variable SPLIT_RESPONSE;
+* is defined for working with learning and test subsamples;
+DATA splitdat;
+SET splitdat; 
+* Here we have the option of choosing whichever sales response;
+* variable we want to use as our response variable;
+* because we are renaming it as ACTUAL_RESPONSE and;
+* SPLIT_RESPONSE... for our learning and test sets;
+* for regression we had used GROSS_SALES_AMT or LOG_GROSS_SALES_AMT;
+* for logistic regression we use the binary response RESP_IND;
+ACTUAL_RESPONSE = RESP_IND;
+SPLIT_RESPONSE = RESP_IND;
+IF SELECTED = 0 THEN SPLIT_RESPONSE = .; * for the test set;
+RUN;
+
+* at this point the SAS dataset splitdat has all observations from fulldat; 
+* with an indicator variable SELECTED taking values 1 or 0;
+* and with a the selected response variable; 
+* with about half the values (test set values) set to missing;
+
+* print first 20 observations to check values of selected variables;
+* new variable SELECTED defines learning and test subsamples;
+TITLE2 "Response Variable Settings for Learning and Test Subsamples";
+OPTIONS OBS = 20;
+PROC PRINT DATA = splitdat; 
+VAR INDIVIDUAL_ID SELECTED GROSS_SALES_AMT RESP_IND ACTUAL_RESPONSE SPLIT_RESPONSE;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+* fit a logistic regression model to the learning set;
+* the structure is similar to what we had used in previous models; 
+* we obtain predicted response values in both learning and test sets;
+* results of predicted and observed response values are output to separate datasets;
+* Logistic regression predictions are probability of a binary response;
+* that is, probability of responding to the promotion RESP_IND = 1;
+* we use the DESCENDING argument to PROC LOGISTIC in order to get predictions;
+* in the desired form... without this argument, PROC LOGISTIC will;
+* run the default, which is to predict the lowest value of the binary response;
+TITLE2 "Fitting an RFM Logistic Regression Model to the Learning Data";
+ODS GRAPHICS ON;  * turn on high-resolution graphics;
+PROC LOGISTIC DATA = splitdat DESCENDING PLOTS=EFFECT PLOTS=ROC; 
+/* --------------------------------------------------------------- */
+* THIS IS THE MODEL BEING EVALUATED.... PUT YOUR FINAL MODEL HERE;
+* This particular example is like an RFM model for direct marketing;
+MODEL SPLIT_RESPONSE = XDAYS_SINCE_LAST_PURCHASE XDAYS_BETWEEN_ORDERS LTD_AVG_ORDER_AMT LTD_GROSS_PURCHASE_AMT/ ; 
+/* --------------------------------------------------------------- */
+ODS OUTPUT ParameterEstimates = model_LTD_GSA; * get 95 percent confidence band on plot;
+OUTPUT OUT = allout PREDICTED = PRED; * save test predicted response values;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+TITLE2 "Learning and Test Set Results for the RFM Logistic Regression Model";
+
+* here we define six distinct rules for targeting;
+DATA allout;
+SET allout;
+IF(PRED > 0.50) THEN TARGET50 = "YES"; ELSE TARGET50 = "NO";
+IF(PRED > 0.40) THEN TARGET40 = "YES"; ELSE TARGET40 = "NO";
+IF(PRED > 0.30) THEN TARGET30 = "YES"; ELSE TARGET30 = "NO";
+IF(PRED > 0.20) THEN TARGET20 = "YES"; ELSE TARGET20 = "NO";
+IF(PRED > 0.10) THEN TARGET10 = "YES"; ELSE TARGET10 = "NO";
+IF(PRED > 0.05) THEN TARGET05 = "YES"; ELSE TARGET05 = "NO";
+RUN;
+
+* print first 40 observations to check values of observed and predicted sales;
+OPTIONS OBS = 40;
+PROC PRINT DATA = allout; 
+VAR INDIVIDUAL_ID SELECTED ACTUAL_RESPONSE SPLIT_RESPONSE PRED TARGET50 TARGET40 TARGET30 TARGET20 TARGET10 TARGET05;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+/* HOW WELL DOES THE MODEL DO IN THE LEARNING/TRAINING SET?        */
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+
+TITLE2 "Learning Set Results for the RFM Logistic Regression Model";
+DATA learnout;
+SET allout;
+IF SELECTED = 0 THEN DELETE;
+RUN;
+
+* construct four-fold tables for observed and predicted values;
+* if you predict YES and the actual response is 1 (YES) that is a correct prediction;
+* if you predict NO and the actual response is 0 (NO) that is a correct prediction;
+* the proportion of correct predictions is a measure of predictive accuracy or fit;
+* the data for computing predictive accuracy may be obtained from four-fold tables;
+PROC FREQ DATA = learnout;
+TABLE ACTUAL_RESPONSE * TARGET50;  * use this to assess proportion of responses correctly predicted;
+TABLE ACTUAL_RESPONSE * TARGET40;
+TABLE ACTUAL_RESPONSE * TARGET30;
+TABLE ACTUAL_RESPONSE * TARGET20;
+TABLE ACTUAL_RESPONSE * TARGET10;
+TABLE ACTUAL_RESPONSE * TARGET05;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+/* HOW WELL DOES THE MODEL DO IN THE TEST SET?                     */
+/* THE CODE THAT FOLLOWS LOOKS AT STATISTICAL PERFORMANCE          */
+/* AND PROVIDES FREQUENCY COUNTS AND REVENUE DATA FOR SUBSEQUENT   */
+/* EVALUATION OF FINANCIAL PERFORMANCE IN A SPREADSHEET            */
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+
+TITLE2 "Test Set Results for the RFM Logistic Regression Model";
+DATA testout;
+SET allout;
+IF SELECTED = 1 THEN DELETE;
+RUN;
+
+* construct four-fold tables for observed and predicted values;
+PROC FREQ DATA = testout;
+TABLE ACTUAL_RESPONSE * TARGET50;   * use this to assess proportion of responses correctly predicted;
+TABLE ACTUAL_RESPONSE * TARGET40;
+TABLE ACTUAL_RESPONSE * TARGET30;
+TABLE ACTUAL_RESPONSE * TARGET20;
+TABLE ACTUAL_RESPONSE * TARGET10; * best cutoff in terms of financial contribution;
+TABLE ACTUAL_RESPONSE * TARGET05;   
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+TITLE2 "Baseline Sales Results from Test Set Customers with No Targeting";
+PROC MEANS DATA = testout;
+VAR GROSS_SALES_AMT;  
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+* evaluate the TARGET50 cutoff rule for targeting;
+* this rule says send the promotional mailer to anyone who has;
+* a predicted probability of responding greater than 0.50;
+TITLE2 "Recommendation from RFM Model (TARGET50 = YES)";
+* Need to sort by TARGET before using PROC MEANS by TARGET;
+PROC SORT DATA=testout OUT=testsrt; BY TARGET50;
+
+PROC MEANS DATA = testsrt;
+VAR GROSS_SALES_AMT;  BY TARGET50;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+* evaluate the TARGET40 cutoff rule for targeting;
+* this rule says send the promotional mailer to anyone who has;
+* a predicted probability of responding greater than 0.40;
+TITLE2 "Recommendation from RFM Model (TARGET40 = YES)";
+* Need to sort by TARGET before using PROC MEANS by TARGET;
+PROC SORT DATA=testout OUT=testsrt; BY TARGET40;
+
+PROC MEANS DATA = testsrt;
+VAR GROSS_SALES_AMT;  BY TARGET40;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+* evaluate the TARGET30 cutoff rule for targeting;
+* this rule says send the promotional mailer to anyone who has;
+* a predicted probability of responding greater than 0.30;
+TITLE2 "Recommendation from RFM Model (TARGET30 = YES)";
+* Need to sort by TARGET before using PROC MEANS by TARGET;
+PROC SORT DATA=testout OUT=testsrt; BY TARGET30;
+
+PROC MEANS DATA = testsrt;
+VAR GROSS_SALES_AMT;  BY TARGET30;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+* evaluate the TARGET20 cutoff rule for targeting;
+* this rule says send the promotional mailer to anyone who has;
+* a predicted probability of responding greater than 0.20;
+TITLE2 "Recommendation from RFM Model (TARGET20 = YES)";
+* Need to sort by TARGET before using PROC MEANS by TARGET;
+PROC SORT DATA=testout OUT=testsrt; BY TARGET20;
+
+PROC MEANS DATA = testsrt;
+VAR GROSS_SALES_AMT;  BY TARGET20;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+* evaluate the TARGET10 cutoff rule for targeting;
+* this rule says send the promotional mailer to anyone who has;
+* a predicted probability of responding greater than 0.10;
+* a predicted probability of responding greater than 0.05;
+* subsequent spreadsheet analysis will show that this is the best;
+* cutoff rule in terms of financial performance;
+* that is, the best rule among the rules we have tested;
+TITLE2 "Recommendation from RFM Model (TARGET10 = YES)";
+* Need to sort by TARGET before using PROC MEANS by TARGET;
+PROC SORT DATA=testout OUT=testsrt; BY TARGET10;
+
+PROC MEANS DATA = testsrt;
+VAR GROSS_SALES_AMT;  BY TARGET10;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+* evaluate the TARGET05 cutoff rule for targeting;
+* this rule says send the promotional mailer to anyone who has;
+TITLE2 "Recommendation from RFM Model (TARGET05 = YES)";
+* Need to sort by TARGET before using PROC MEANS by TARGET;
+PROC SORT DATA=testout OUT=testsrt; BY TARGET05;
+
+PROC MEANS DATA = testsrt;
+VAR GROSS_SALES_AMT;  BY TARGET05;
+RUN;
+
+
+
