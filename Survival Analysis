@@ -1,0 +1,961 @@
+
+
+Building and Testing a Survival Data Model
+
+Provided by Northwestern University
+
+/* This example solution shows how to set things up for a survival data model
+  using the time-defined response variable time-to-order (TIME_TO_ORDER).
+  Other solutions to the survival data modeling could involve alternative
+  time-defined response variables, such as various tenure variables.
+  
+  Time-to_order, as it turns out, is nothing more than the recency variable
+  that we had used in regression and logistic regression models. But now
+  we are thinking of it as a response with right-censoring. Customers who
+  do not respond to the promotion have an uncertain order date in the future,
+  so their time-to-order is thought of as censored at the date of promotion.
+
+  This solution shows how to set up learning and test datasets and 
+  how to use multiple imputation as part of the modeling process.
+  Initial data exploration is via PROC LIFETEST.
+  Preliminary predictive models are fit with PROC LIFEREG.
+  These set the stage for subsequent modeling with PROC PHREG.
+
+  The regression and logistic models helped us to define whom to target.
+  The survival model may be able to show us when to target.
+  That is, using a time-to-order response variable, we can fit
+  a survival model that shows how many days we may need to wait
+  until a customer's expected probability of placing an order is
+  greater than 0.10, 0.20, ..., and so on. If the model works, we may be
+  able to generate daily customized promotions. Each day, we decide which
+  which particular customers should receive our promotional mailings.  
+  
+  In an actual predictive modeling setting, of course, there would
+  be nothing to prevent us from using a combination of models.
+  We might use logisitic regression to determine which customers 
+  to target and proportional hazards regression to determine when
+  to send the promotional mailing.
+  
+  Thinking about the predictive modeling work we have been doing,
+  logistic regression predicts who will respond to the promotion.
+  Multiple linear regression predicts how much they will order.
+  And survival data models predict when they will order. 
+  Comparing these three tasks, predicting when customers
+  will place their orders is clearly the most challenging.  
+  
+  In summmary, we have this way of thinking about predictive modeling
+  methods reviewed in this course:
+  
+  Multiple linear regression (OLS, normal model): predict "how much"
+  Logistic regression: predict "if"
+  Survival models: predict "when"
+  
+  What makes our use of models different from other disciplines is
+  our focus upon prediction. We fit models just like researchers in
+  other disciplines. But we use them differently. We are concerned with
+  how well we can predict things, so that we can use models in 
+  decision making. Hence our emphasis upon obtaining output from models
+  and assessing the value of that output in terms of dollars and cents.
+  
+  The language of survival analysis, coming as it does from medical
+  research primarily, considers the event (death) as being bad and
+  survival as good. For problems when the event is good, we have to
+  think about what we are doing with the output from survival models.
+  When the event is good, like a response to promotion, then "survival"
+  is not good. Wnen the event is of low frequency, like response to
+  promotion, then we look to low values for the probability of 
+  survival when defining our cutoffs for targeting. Lower is better. 
+  
+*/
+
+
+ODS GRAPHICS ON; * to get high resolution graphics output from selected PROCs;
+OPTIONS OBS = MAX; * reset option to analyze and report on all data;
+
+* Read in the demographics data without header row;
+FILENAME demo '/courses/u_northwestern.edu1/i_810095/c_3190/predict410_session1_demodat.csv'; 
+DATA demodat;
+INFILE demo DSD;
+INPUT INDIVIDUAL_ID MED_INC MED_HOME_VALUE MED_RENT MED_LENGTH_OF_RESIDENCE
+NUM_CHILD NUMB_ADLT ADVERTISING AVG_NO_OF_BANK_ACCNT OWN_HOME LOR MARRIAGE_STATUS
+INTESTEST_IN_SPORT INTEREST_IN_DIY INTEREST_IN_TRAVEL GENDER $ AGE;
+DATALINES;
+ ...
+RUN;
+
+* Read in the sales data without header row and with dates as character strings;
+FILENAME sales '/courses/u_northwestern.edu1/i_810095/c_3190/predict410_session1_salesdat.csv'; 
+DATA salesdat;
+INFILE sales DSD;
+INPUT INDIVIDUAL_ID LTD_GROSS_NUM_ORDERS LTD_GROSS_PURCHASE_AMT LTD_GROSS_PURCHASE_UNITS
+ LTD_AVG_ORDER_AMT LTD_AVG_ORDER_UNITS FIRST_PURCHASE_DATE $ FIRST_PURCHASE_AMT      
+ LAST_PURCHASE_DATE $ LAST_PURCHASE_AMT CLOSEST_STORE_DISTANCE RETAIL_DOLLARS          
+ RETAIL_ORDERS DIRECT_DOLLARS DIRECT_ORDERS GROSS_SELL_AMT GROSS_QTY RESP_IND;
+ DATALINES;
+ ...
+RUN;
+ 
+* Here we do a sort on INDIVIDUAL_ID to ensure that the datasets;
+* line up correctly for subsequent merging into the alldat dataset;
+PROC SORT DATA=demodat OUT=demosrt; BY INDIVIDUAL_ID;
+PROC SORT DATA=salesdat OUT=salessrt; BY INDIVIDUAL_ID;
+RUN;
+
+* Merge the demographics and sales data;
+DATA alldat;
+MERGE demosrt salessrt;
+BY INDIVIDUAL_ID;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+* Delete observations lacking critical date;
+* or lifetime purchase information;
+* as needed for modeling work;
+* There are not very many of these;
+DATA alldat;
+SET alldat;
+IF LAST_PURCHASE_DATE = '' THEN DELETE;
+IF FIRST_PURCHASE_DATE = '' THEN DELETE;
+
+* --------- THIS IS THE M IN RFM (possible use in survival models) ---------;
+IF LTD_AVG_ORDER_AMT = . THEN DELETE; * Monetary value type one;
+IF LTD_GROSS_PURCHASE_AMT = . THEN DELETE; * Monetary value type two;
+
+* --------- IF THE BINARY RESPONSE IS MISSING THEN DELETE -------;
+* Note. RESP_IND = 0 is indicator of censoring in survival models for TIME_TO_ORDER;
+IF RESP_IND = . THEN DELETE; 
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+* clone response variables for regression and logistic regression;
+* replace missing sales response data with zeroes;
+* and create new gender and date variables;
+DATA alldat;
+SET alldat;
+GROSS_SALES_AMT = GROSS_SELL_AMT;
+IF GROSS_SALES_AMT = . THEN GROSS_SALES_AMT = 0; 
+
+* log sales as possible response;
+LOG_GROSS_SALES_AMT = LOG(GROSS_SALES_AMT + 1); 
+
+GROSS_QUANTITY = GROSS_QTY;
+IF GROSS_QUANTITY = . THEN GROSS_QUANTITY = 0; 
+
+* Add code U for undefined to GENDER;
+IF GENDER ^in('M','F') THEN GENDER='U';
+
+* Define MALE as binary indicator variable;
+IF GENDER ='M' THEN MALE=1; ELSE MALE=0;
+
+* Define FEMALE as binary indicator variable;
+IF GENDER ='F' THEN FEMALE=1; ELSE FEMALE=0;
+
+* Create date variables for subsequent analysis;
+* Character to date format with base date January 1, 1960;
+* So XLAST_PURCHASE_DATE shows number of days since January 1, 1960;
+XLAST_PURCHASE_DATE = input(LAST_PURCHASE_DATE, mmddyy10.); 
+
+* Character to date format;
+XFIRST_PURCHASE_DATE = input(FIRST_PURCHASE_DATE, mmddyy10.); 
+
+* WORKING THE DATES ---------------------------------------------------;
+* Note that we had previously used TODAY() as a base date for computing;
+* date-defined variables like XDAYS_SINCE_LAST_PURCHASE and;
+* XDAYS_SINCE_FIRST_PURCHASE (tenure)....;
+* But TODAY() means today's date, which changes every day;
+* To provide code that yields results that are reproducible;
+* from one run to the next, we will use an imagined day of;
+* the promotion to provide the date baseline for date variables;
+* That way results will be consistent across time;
+* The idea of reproducibility of runs is one we have employed;
+* previously in setting random number generator seed values;
+* Note the following date ranges in the sample data;
+
+* A review of the sample data shows that;
+* FIRST_PURCHASE_DATE goes from 1/1/00 to 6/6/10;
+* LAST_PURCHASE_DATE goes from 8/16/03 to 12/13/10;
+
+* In the code that follows for date calculations;
+* we arbitrarily set 12/14/10 as our date for the promotion;
+* Here we define the constant variable DATE_OF_PROMOTION;
+DATE_OF_PROMOTION = '12/14/10'; * arbitrary date constant as character string;
+XDATE_OF_PROMOTION = input(DATE_OF_PROMOTION, mmddyy10.); * set character string as date type;
+
+* --------- COMPUTE THE R IN RFM ---------;
+XDAYS_SINCE_LAST_PURCHASE = XDATE_OF_PROMOTION - XLAST_PURCHASE_DATE; * Recency Variable;   
+
+* --------- COMPUTE THE F IN RFM ---------;
+XDAYS_BETWEEN_FIRST_AND_LAST = (XLAST_PURCHASE_DATE - XFIRST_PURCHASE_DATE);
+XDAYS_BETWEEN_ORDERS = XDAYS_BETWEEN_FIRST_AND_LAST/LTD_GROSS_NUM_ORDERS; * Frequency Variable;
+
+* --------- TWO POSSIBLE TENURE VARIABLES (PICK YOUR POISON) -------;
+* Tenure represents a time-defined response for survival models;
+* As set up here, these response measures have complete data;
+* That is, they have no associated censoring variable;
+* One tenure-related variable is the days since first purchase; 
+* This can be used in predictive models for sales response or;
+* binary response to the promtion;
+* Here we are assuming that all of the customers in our sample data;
+* are still our customers...  whether or not they responded to the promotion;
+XDAYS_SINCE_FIRST_PURCHASE = XDATE_OF_PROMOTION - XFIRST_PURCHASE_DATE; 
+
+* ///////////// Time-defined response variable \\\\\\\\\\\\\\;
+TENURE_PRE_PROMOTION = XDAYS_SINCE_FIRST_PURCHASE; 
+
+* Another tenure-related variable would consider the promotion response;
+* Here if someone has not responded to the promotion we consider;
+* the date of the last purchase as the the last purchase date;
+* That is, we do not assume that all of the customers in our sample data;
+* are still our customers...  if they responded to the promotion they are;
+* but if they did not respond to the promotion, we do not know;
+* if they are still our customers;
+* Note that this tenure variable cannot be used in predictive models;
+* for sales response or for binary response to the promotion;
+* because it is defined using the binary response RESP_IND itself; 
+
+YDAYS_SINCE_FIRST_PURCHASE = XDATE_OF_PROMOTION - XFIRST_PURCHASE_DATE;
+IF(RESP_IND = 0) THEN YDAYS_SINCE_FIRST_PURCHASE = XLAST_PURCHASE_DATE - XFIRST_PURCHASE_DATE;
+
+* ///////////// Time-defined response variable \\\\\\\\\\\\\\;
+TENURE_POST_PROMOTION = YDAYS_SINCE_FIRST_PURCHASE;
+
+* ----------- TIME-TO-ORDER VARIABLE (ALTERNATIVE TO TENURE) ---------;
+* This is an alternative time-defined response variable for survival models;
+* This gets at the question "when do customers order?" or, alternatively;
+* "when should we send the next promotional mailer to a customer?";
+* This is nothing more than the already computed recency variable;
+
+*   XDAYS_SINCE_LAST_PURCHASE = XDATE_OF_PROMOTION - XLAST_PURCHASE_DATE;
+
+* ///////////// Time-defined response variable \\\\\\\\\\\\\\;
+TIME_TO_ORDER = XDAYS_SINCE_LAST_PURCHASE;
+
+* With right-censoring indicated by RESP_IND = 0 for nonresponders;
+* --------------------------------------------------------------------;
+RUN;
+
+
+* print first 20 observations to check values of selected date variables;
+* we look at the character strings and the computed numeric date variables;
+TITLE2 "Character and Numeric Date Variables across the Entire Sample";
+OPTIONS OBS = 20;
+PROC PRINT DATA = alldat; 
+VAR INDIVIDUAL_ID RESP_IND FIRST_PURCHASE_DATE LAST_PURCHASE_DATE DATE_OF_PROMOTION
+XFIRST_PURCHASE_DATE XLAST_PURCHASE_DATE XDATE_OF_PROMOTION;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+* print first 20 observations to check values of calculated date variables;
+* we look at the character strings and the computed numeric date variables;
+TITLE2 "Numeric Computed Date Variables across the Entire Sample";
+OPTIONS OBS = 20;
+PROC PRINT DATA = alldat; 
+VAR INDIVIDUAL_ID RESP_IND XFIRST_PURCHASE_DATE XLAST_PURCHASE_DATE XDATE_OF_PROMOTION
+XDAYS_SINCE_LAST_PURCHASE XDAYS_SINCE_FIRST_PURCHASE YDAYS_SINCE_FIRST_PURCHASE;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+* print first 20 observations to check values of calculated date variables;
+* we look at the character strings and the computed numeric date variables;
+TITLE2 "Numeric Computed Frequency Variable across the Entire Sample";
+OPTIONS OBS = 20;
+PROC PRINT DATA = alldat; 
+VAR INDIVIDUAL_ID RESP_IND XFIRST_PURCHASE_DATE XLAST_PURCHASE_DATE 
+XDAYS_BETWEEN_FIRST_AND_LAST LTD_GROSS_NUM_ORDERS XDAYS_BETWEEN_ORDERS;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+* print first 20 observations to check values of calculated date variables;
+* we look at the character strings and the computed numeric date variables;
+TITLE2 "Time-Defined Response Variables for Survival Data Models";
+OPTIONS OBS = 20;
+PROC PRINT DATA = alldat; 
+VAR INDIVIDUAL_ID RESP_IND XFIRST_PURCHASE_DATE XLAST_PURCHASE_DATE 
+XDATE_OF_PROMOTION TENURE_PRE_PROMOTION TENURE_POST_PROMOTION TIME_TO_ORDER;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+/* STARTING HERE WE WILL FOCUS UPON TIME_TO_ORDER AS THE RESPONSE  */
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+
+/* /////////////////////////////////////////////////////////////// */
+/*              INITIAL SURVIVAL DATA EXAMINATION                  */
+/* /////////////////////////////////////////////////////////////// */
+
+TITLE2 "Survival Data Preparation Prior to Learn/Test Survival Analysis";
+
+PROC LIFETEST DATA = alldat METHOD = LIFE PLOTS = (S,H) METHOD = KM CENSOREDSYMBOL = "+";
+TIME TIME_TO_ORDER*RESP_IND(0);
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* DATA CLEANING: DELETE WHAT APPEAR TO BE TIME-TO-ORDER OUTLERS   */
+/* /////////////////////////////////////////////////////////////// */
+
+DATA alldat;
+SET alldat;
+IF TIME_TO_ORDER > 1000 THEN DELETE;
+RUN;
+
+* Examine the survial and hazard functions after eliminating;
+* obvious time-to-order outliers;
+TITLE2 "Survival Data after Deleting Time-to-Order Outliers";
+PROC LIFETEST DATA = alldat METHOD = LIFE PLOTS = (S,H) METHOD = KM CENSOREDSYMBOL = "+";
+TIME TIME_TO_ORDER*RESP_IND(0);
+RUN;
+
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+TITLE2 "Prepare for Dividing into Learning and Test Subsamples";
+* here we use PROC SURVEYSELECT to split the data into two subsamples;
+* simple random sampling without replacement;
+* splits full dataset into two with 6500 in learning set;
+* Setting the seed ensures reproducibility of results from;
+*   one run of this program to the next;
+* specify that all original observations will be included in splitdat;
+PROC SURVEYSELECT DATA = alldat
+METHOD = SRS 
+N = 5000 
+SEED = 77777 
+OUT = splitdat 
+OUTALL; 
+RUN;
+
+* let learning set be SELECTED = 1;
+* let test set be SELECTED = 0;
+* define test data set as having missing values;
+* new response variable SPLIT_RESPONSE;
+* is defined for working with learning and test subsamples;
+DATA splitdat;
+SET splitdat; 
+* Here we have the option of choosing whichever sales response;
+* variable we want to use as our response variable;
+* because we are renaming it as ACTUAL_RESPONSE and;
+* SPLIT_RESPONSE... for our learning and test sets;
+* for regression we had used GROSS_SALES_AMT or LOG_GROSS_SALES_AMT;
+* for logistic regression we use the binary response RESP_IND;
+ACTUAL_RESPONSE = TIME_TO_ORDER;
+SPLIT_RESPONSE = TIME_TO_ORDER;
+IF SELECTED = 0 THEN SPLIT_RESPONSE = .; * for the test set;
+RUN;
+
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+TITLE2 "Multiple Imputation after Learning/Test Setup";
+* Define set of explanatory variables for use in multiple imputation;
+* Though not needed for the RFM model many of these may be useful later;
+* In developing survival models for tenure, for example, we may want to;
+* use demographic variables that have missing data;
+
+%let MI_VARIABLES =
+MED_INC 
+MED_HOME_VALUE 
+MED_RENT 
+MED_LENGTH_OF_RESIDENCE
+NUM_CHILD 
+NUMB_ADLT  
+AVG_NO_OF_BANK_ACCNT  
+LOR 
+AGE;
+  
+  
+/* Note. Categorical demographic variables omitted from multiple imputation.
+         With the definition of level U for GENDER, these have complete data 
+         in this case: 
+         
+         MALE 
+         FEMALE 
+         OWN_HOME 
+         MARRIAGE_STATUS. 
+         
+        Note that PROC MI has a CLASS method for imputing categorical variables
+        when that sort of need arises. Here it is not needed.
+        
+        Non-demographic variables omitted from the multiple imputation 
+        list this time around because the assignment asks for a predictive 
+        model that uses demographic variables only:
+        
+INTESTEST_IN_SPORT 
+INTEREST_IN_DIY 
+INTEREST_IN_TRAVEL 
+ADVERTISING
+   LTD_GROSS_NUM_ORDERS 
+LTD_GROSS_PURCHASE_AMT 
+LTD_GROSS_PURCHASE_UNITS
+LTD_AVG_ORDER_AMT 
+LTD_AVG_ORDER_UNITS  
+FIRST_PURCHASE_AMT      
+LAST_PURCHASE_AMT 
+CLOSEST_STORE_DISTANCE 
+RETAIL_DOLLARS          
+RETAIL_ORDERS DIRECT_DOLLARS 
+DIRECT_ORDERS
+XLAST_PURCHASE_DATE
+XFIRST_PURCHASE_DATE
+XDAYS_SINCE_LAST_PURCHASE
+XDAYS_SINCE_FIRST_PURCHASE
+XDAYS_BETWEEN_ORDERS 
+*/
+
+* Multiple imputation across the demographic variable set;
+* If there are missing data on any of these variables;
+* replacement data values will be obtained from a;
+* multiple regression model utilizing all demographic variables;
+* Setting the seed ensures reproducibility of results from;
+*   one run of this program to the next;
+TITLE2 "Multiple Imputations Prior to Survival Data Analysis";
+PROC MI DATA = splitdat seed=77777 out = midat;
+MCMC;
+VAR &MI_VARIABLES;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/*  SET UP GENDER_CLASS AS CLASS VARIABLE CODED 1/2/3 FOR M/F/U    */
+/*  NEEDED FOR CATEGORICAL EXPLANATORY VARIABLE EFFECT TESTS       */
+/*  This will give us three separate ways of specifying gender     */
+/*        (1) GENDER character data M/F/U                          */
+/*        (2) MALE and FEMALE binary indicators                    */
+/*        (3) GENDER_CLASS 1/2/3 FOR M/F/U                         */
+/* /////////////////////////////////////////////////////////////// */
+DATA midat;
+SET midat;
+GENDER_CLASS = 1;
+IF(FEMALE = 1) THEN GENDER_CLASS = 2;
+IF(MALE = 0 AND FEMALE = 0) THEN GENDER_CLASS = 3;
+RUN;
+
+* show contents of the full data set prior to splitting;
+TITLE2 "Contents of the Multiple Imputation Data Set (5 Imputations)";
+PROC CONTENTS DATA = midat;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* SET UP NAMED EXPLANATORY VARIABLE SETS FOR EASE IN PROGRAMMING  */
+/* /////////////////////////////////////////////////////////////// */
+%let EXPLANATORY_VARIABLES =
+MED_INC 
+MED_HOME_VALUE 
+MED_RENT 
+MED_LENGTH_OF_RESIDENCE
+NUM_CHILD 
+NUMB_ADLT  
+AVG_NO_OF_BANK_ACCNT 
+LOR 
+AGE
+OWN_HOME
+MARRIAGE_STATUS;
+
+%let CONTINUOUS_EXPLANATORY_VARIABLES =
+MED_INC 
+MED_HOME_VALUE 
+MED_RENT 
+MED_LENGTH_OF_RESIDENCE
+NUM_CHILD 
+NUMB_ADLT  
+AVG_NO_OF_BANK_ACCNT 
+LOR 
+AGE;  * use GENDER_CLASS as class variable in models;
+
+%let CAT_EXPLANATORY_VARIABLES =
+OWN_HOME
+MARRIAGE_STATUS
+GENDER_CLASS;  * use GENDER_CLASS as class variable in models;
+
+
+/* //////////////////////////////////////////////////////////////// */
+/*          SET UP FIVE MULTIPLE IMPUTATION DATA SETS               */
+/*                                                                  */
+/* Note that we will set up separate datasets explicity to walk     */
+/* through the process of implementing multiple imputation in       */
+/* obtaining trustworthy predictions. Some SAS modeling procedures  */
+/* offer a command structure to automate the process. Look for      */
+/*                                                                  */
+/*                      by _Imputation_;                             */
+/*                                                                  */
+/* Documentation for SAS multiple imputation may be found at        */
+/* http://support.sas.com/rnd/app/papers/multipleimputation.pdf     */
+/*                                                                  */
+/* //////////////////////////////////////////////////////////////// */
+/* For our learning and test set work we choose  
+   instances of the multiple imputation datasets.
+   We prepare all five imputations for our survival modeling */
+DATA midat1;
+SET midat;
+IF(_Imputation_ ^= 1) THEN DELETE;
+RUN;
+
+DATA midat2;
+SET midat;
+IF(_Imputation_ ^= 2) THEN DELETE;
+RUN;
+
+DATA midat3;
+SET midat;
+IF(_Imputation_ ^= 3) THEN DELETE;
+RUN;
+
+DATA midat4;
+SET midat;
+IF(_Imputation_ ^= 4) THEN DELETE;
+RUN;
+
+DATA midat5;
+SET midat;
+IF(_Imputation_ ^= 5) THEN DELETE;
+RUN;
+
+* provide a short listing of variable values to check the data;
+OPTIONS OBS = 4;
+PROC PRINT DATA = midat; 
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+
+
+/* /////////////////////////////////////////////////////////////// */
+/*  EXPLORE DEMOGRAPHIC VARIABLE RELATIONSHIPS TO TIME-TO-ORDER    */
+/*       WE WILL DO THIS USING JUST THE FIRST IMPUTATION           */
+/* /////////////////////////////////////////////////////////////// */
+
+* Explore relationship between demographic factors and time-to-order;
+* Where we are now working only with the learning set;
+* This is done by using SPLIT_RESPONSE as the response variable;
+TITLE2 "Explore Survival Function Across Gender Groups";
+PROC LIFETEST DATA = midat1 METHOD = LIFE PLOTS = S(TEST) METHOD = KM CENSOREDSYMBOL = "+";
+TIME SPLIT_RESPONSE*RESP_IND(0);
+STRATA GENDER;
+RUN;
+
+TITLE2 "Explore Survival Function Across Demographic Factors";
+PROC LIFETEST DATA = midat1 METHOD = LIFE METHOD = KM CENSOREDSYMBOL = "+";
+TIME SPLIT_RESPONSE*RESP_IND(0);
+TEST &EXPLANATORY_VARIABLES;
+RUN;
+
+
+/* /////////////////////////////////////////////////////////////// */
+/* SET UP NAMED EXPLANATORY VARIABLE SET FOR PREDICTIVE MODELING   */
+/* Here we are setting up selected demographic variables.          */
+/* In an actual predictive modeling settig we would use any        */
+/* explanatory variable that has no overlap in definition with     */
+/* the selected response variable.                                 */
+/* PROC LIFETEST: explanatory variables cannot be time-dependent   */
+/* PROC PHREG: allows constant and time-dependent variables        */
+/* /////////////////////////////////////////////////////////////// */
+%let SELECTED_EXPLANATORY_VARIABLES =
+MED_INC 
+MED_HOME_VALUE 
+MED_RENT 
+MED_LENGTH_OF_RESIDENCE
+MARRIAGE_STATUS
+GENDER_CLASS; 
+
+/* /////////////////////////////////////////////////////////////// */
+/*          SURVIVAL MODEL FIT TO FIRST IMPUTATION                 */
+/*   WE WILL TEST FIVE ALTERNATIVE DISTRIBUTIONS FOR THE MODEL     */
+/* /////////////////////////////////////////////////////////////// */
+
+* Note that no effort is being made here to do variable selection;
+* We are merely using the entire set of demographic variables;
+* as our explanatory variables in the fitted survival data models;
+
+* Here we set up a parametric survival data model using the Weibull distribution;
+* TIME_TO_ORDER is the time-defined response variable being predicted;
+* Uncensored data are those data for customers who have responded
+* to the promotion... these have RESP_IND = 1;
+* Accordingly the censored cases, the non-respondents have RESP_IND = 0;
+* so we set the censoring indicator in the models as RESP_IND(0);
+
+TITLE2 "Survival Data Analysis of First Imputation (Normal Model)";
+PROC LIFEREG DATA = midat1;
+CLASS MARRIAGE_STATUS GENDER_CLASS; * needed for anova effect testing;
+MODEL SPLIT_RESPONSE*RESP_IND(0) = &SELECTED_EXPLANATORY_VARIABLES / D=NORMAL;
+PROBPLOT;
+RUN;
+
+TITLE2 "Survival Data Analysis of First Imputation (Weibull Model)";
+PROC LIFEREG DATA = midat1;
+CLASS MARRIAGE_STATUS GENDER_CLASS; * needed for anova effect testing;
+MODEL SPLIT_RESPONSE*RESP_IND(0) = &SELECTED_EXPLANATORY_VARIABLES / D=WEIBULL;
+PROBPLOT;
+RUN;
+
+TITLE2 "Survival Data Analysis of First Imputation (Exponential Model)";
+PROC LIFEREG DATA = midat1;
+CLASS MARRIAGE_STATUS GENDER_CLASS; * needed for anova effect testing;
+MODEL SPLIT_RESPONSE*RESP_IND(0) = &SELECTED_EXPLANATORY_VARIABLES / D=EXPONENTIAL;
+PROBPLOT;
+RUN;
+
+TITLE2 "Survival Data Analysis of First Imputation (Log-Logistic)";
+PROC LIFEREG DATA = midat1;
+CLASS MARRIAGE_STATUS GENDER_CLASS; * needed for anova effect testing;
+MODEL SPLIT_RESPONSE*RESP_IND(0) = &SELECTED_EXPLANATORY_VARIABLES / D=LLOGISTIC;
+PROBPLOT;
+RUN;
+
+* On previous runs we see that the log-normal fits best...;
+* so we output predictions from the log-normal model for this imputation;
+* and we run and output predictions from the other imputations;
+* using the log-normal model for the survival distribution;
+* QUANTILES = (.10) for 10th percentile of survival time;
+TITLE2 "Survival Data Analysis of First Imputation (Log-Normal Model)";
+PROC LIFEREG DATA = midat1;
+CLASS MARRIAGE_STATUS GENDER_CLASS; * needed for anova effect testing;
+MODEL SPLIT_RESPONSE*RESP_IND(0) = &SELECTED_EXPLANATORY_VARIABLES / D=LOGNORMAL;
+PROBPLOT;
+OUTPUT OUT=output1 QUANTILES = (.05 .10 .15 .20) P = PCTPRED;
+RUN;
+
+
+/* /////////////////////////////////////////////////////////////// */
+/*          SURVIVAL MODEL FIT TO SECOND IMPUTATION                */
+/* /////////////////////////////////////////////////////////////// */
+
+TITLE2 "Survival Data Analysis of Second Imputation (Log-Normal Model)";
+
+PROC LIFEREG DATA = midat2;
+CLASS MARRIAGE_STATUS GENDER_CLASS; * needed for anova effect testing;
+MODEL SPLIT_RESPONSE*RESP_IND(0) = &SELECTED_EXPLANATORY_VARIABLES / D=LOGNORMAL;
+PROBPLOT;
+OUTPUT OUT=output2 QUANTILES = (.05 .10 .15 .20) P = PCTPRED;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/*           SURVIVAL MODEL FIT TO THIRD IMPUTATION                */
+/* /////////////////////////////////////////////////////////////// */
+
+TITLE2 "Survival Data Analysis of Third Imputation (Log-Normal Model)";
+
+PROC LIFEREG DATA = midat3;
+CLASS MARRIAGE_STATUS GENDER_CLASS; * needed for anova effect testing;
+MODEL SPLIT_RESPONSE*RESP_IND(0) = &SELECTED_EXPLANATORY_VARIABLES / D=LOGNORMAL;
+PROBPLOT;
+OUTPUT OUT=output3 QUANTILES = (.05 .10 .15 .20) P = PCTPRED;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/*           SURVIVAL MODEL FIT TO FOURTH IMPUTATION               */
+/* /////////////////////////////////////////////////////////////// */
+
+TITLE2 "Survival Data Analysis of Fourth Imputation (Log-Normal Model)";
+
+PROC LIFEREG DATA = midat4;
+CLASS MARRIAGE_STATUS GENDER_CLASS; * needed for anova effect testing;
+MODEL SPLIT_RESPONSE*RESP_IND(0) = &SELECTED_EXPLANATORY_VARIABLES / D=LOGNORMAL;
+PROBPLOT;
+OUTPUT OUT=output4 QUANTILES = (.05 .10 .15 .20) P = PCTPRED;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/*            SURVIVAL MODEL FIT TO FIFTH IMPUTATION               */
+/* /////////////////////////////////////////////////////////////// */
+
+TITLE2 "Survival Data Analysis of Fifth Imputation (Log-Normal Model)";
+
+PROC LIFEREG DATA = midat5;
+CLASS MARRIAGE_STATUS GENDER_CLASS; * needed for anova effect testing;
+MODEL SPLIT_RESPONSE*RESP_IND(0) = &SELECTED_EXPLANATORY_VARIABLES / D=LOGNORMAL;
+PROBPLOT;
+OUTPUT OUT=output5 QUANTILES = (.05 .10 .15 .20) P = PCTPRED;
+RUN;
+
+* Show contents of the one of the output datasets;
+TITLE2 "Contents of One Set of Survival Predictions from Multiple Imputations";
+PROC CONTENTS DATA = output5;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* POST-PROCESSING OF OUTPUT TO GRAB SELECTED QUANTILE PREDICTIONS */
+/* HERE WE CHOOSE THE TENTH PERCENTILE/QUANTILE PREDICTIONS        */
+/* /////////////////////////////////////////////////////////////// */
+DATA outpred1;
+SET output1;
+IF _PROB_ ^= 0.10 THEN DELETE;
+TENPRED1 = PCTPRED;
+RUN;
+
+DATA outpred2;
+SET output2;
+IF _PROB_ ^= 0.10 THEN DELETE;
+TENPRED2 = PCTPRED;
+RUN;
+
+DATA outpred3;
+SET output3;
+IF _PROB_ ^= 0.10 THEN DELETE;
+TENPRED3 = PCTPRED;
+RUN;
+
+DATA outpred4;
+SET output4;
+IF _PROB_ ^= 0.10 THEN DELETE;
+TENPRED4 = PCTPRED;
+RUN;
+
+DATA outpred5;
+SET output5;
+IF _PROB_ ^= 0.10 THEN DELETE;
+TENPRED5 = PCTPRED;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/*          AGGREGATE PREDICTIONS ACROSS THE IMPUTATIONS           */
+/* /////////////////////////////////////////////////////////////// */
+
+* Here we do a sort on INDIVIDUAL_ID to ensure that the outpred;
+* data sets line up correctly for subsequent merging;
+PROC SORT DATA=outpred1 OUT=outpred1; BY INDIVIDUAL_ID;
+PROC SORT DATA=outpred2 OUT=outpred2; BY INDIVIDUAL_ID;
+PROC SORT DATA=outpred3 OUT=outpred3; BY INDIVIDUAL_ID;
+PROC SORT DATA=outpred4 OUT=outpred4; BY INDIVIDUAL_ID;
+PROC SORT DATA=outpred5 OUT=outpred5; BY INDIVIDUAL_ID;
+RUN;
+
+* Merge the demographics and sales data;
+DATA outall;
+MERGE outpred1 outpred2 outpred3 outpred4 outpred5;
+BY INDIVIDUAL_ID;
+PRED_TIME_TO_ORDER = (TENPRED1 + TENPRED2 + TENPRED3 + TENPRED4 + TENPRED5)/5;
+KEEP INDIVIDUAL_ID SELECTED RESP_IND GROSS_SALES_AMT TIME_TO_ORDER 
+SPLIT_RESPONSE PRED_TIME_TO_ORDER TENPRED1 TENPRED2 TENPRED3 TENPRED4 TENPRED5;
+RUN;
+
+* Show contents of the full data set with observed and predicted values;
+* across all five imputations... and aggregate predictions;
+TITLE2 "Contents of the Aggregate Survival Predictions from Multiple Imputations";
+PROC CONTENTS DATA = outall;
+RUN;
+
+* print first 20 observations to check calculations and show observed and predicted values;
+OPTIONS OBS = 20;
+PROC PRINT DATA = outall; 
+VAR INDIVIDUAL_ID SELECTED PRED_TIME_TO_ORDER TENPRED1 TENPRED2 TENPRED3 TENPRED4 TENPRED5;
+RUN;
+
+PROC PRINT DATA = outall; 
+VAR INDIVIDUAL_ID SELECTED RESP_IND GROSS_SALES_AMT TIME_TO_ORDER 
+SPLIT_RESPONSE PRED_TIME_TO_ORDER;
+RUN;
+
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+
+/* /////////////////////////////////////////////////////////////// */
+/*     ASSESS PREDICTIVE PERFORMANCE OF SURVIVAL DATA MODELS       */
+/*     BEGIN BY SETTING UP TARGETING RULES FOR PROMOTIONS          */
+/* /////////////////////////////////////////////////////////////// */
+
+* here we define four predicted time to order rules for targeting;
+DATA outall;
+SET outall;
+
+* For this group of targeted customers we are saying;
+* that there is at least a ten percent chance that they;
+* will place an order in less than 90 days;
+IF(PRED_TIME_TO_ORDER < 90)  THEN TARGET90 = 1; ELSE TARGET90 = 0;
+
+* For this group of targeted customers we are saying;
+* that there is at least a ten percent chance that they;
+* will place an order in less than 75 days;
+IF(PRED_TIME_TO_ORDER < 75)  THEN TARGET75 = 1; ELSE TARGET75 = 0;
+
+* For this group of targeted customers we are saying;
+* that there is at least a ten percent chance that they;
+* will place an order in less than 60 days;
+IF(PRED_TIME_TO_ORDER < 60)  THEN TARGET60 = 1; ELSE TARGET60 = 0;
+
+* For this group of targeted customers we are saying;
+* that there is at least a ten percent chance that they;
+* will place an order in less than 45 days;
+IF(PRED_TIME_TO_ORDER < 45)  THEN TARGET45 = 1; ELSE TARGET45 = 0;
+
+* For this group of targeted customers we are saying;
+* that there is at least a ten percent chance that they;
+* will place an order in less than 30 days;
+IF(PRED_TIME_TO_ORDER < 30)  THEN TARGET30 = 1; ELSE TARGET30 = 0;
+
+
+TITLE2 "Survival Predictions Converted to Predicted Time-to-Order Targets";
+* print first 20 observations to check values of observed and predicted sales;
+OPTIONS OBS = 20;
+PROC PRINT DATA = outall; 
+VAR INDIVIDUAL_ID SELECTED RESP_IND GROSS_SALES_AMT TIME_TO_ORDER SPLIT_RESPONSE 
+PRED_TIME_TO_ORDER 
+TARGET90
+TARGET75
+TARGET60
+TARGET45
+TARGET30;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+/*    HOW WELL DOES THE MODEL DO IN THE LEARNING/TRAINING SET?     */
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+
+* gather up the cases in the learning data set;
+DATA learnout;
+SET outall;
+IF (SELECTED = 0) THEN DELETE;
+RUN;
+
+TITLE2 "Correlation: Predicted Time-to-Order to Actual Time-to-Order and Sales in the Learning Set";
+PROC CORR DATA = learnout;
+VAR PRED_TIME_TO_ORDER;
+WITH TIME_TO_ORDER GROSS_SALES_AMT;
+RUN;
+
+TITLE2 "Correlation: Time-to-Order Targets with Actual Sales Response in the Learning Set";
+PROC CORR DATA = learnout;
+VAR GROSS_SALES_AMT;
+WITH TARGET90 TARGET75 TARGET60 TARGET45 TARGET30;
+RUN;
+
+TITLE2 "Four-Fold Tables between Actual Binary Response and Time-to-Order Targets (Learning Set)";
+* construct four-fold tables for observed and predicted values;
+* if you predict  1 (YES) and the actual response is 1 (YES) that is a correct prediction;
+* if you predict 0 (NO) and the actual response is 0 (NO) that is a correct prediction;
+* the proportion of correct predictions is a measure of predictive accuracy or fit;
+* the data for computing predictive accuracy may be obtained from four-fold tables;
+PROC FREQ DATA = learnout;
+TABLE RESP_IND * TARGET90;
+TABLE RESP_IND * TARGET75;
+TABLE RESP_IND * TARGET60;
+TABLE RESP_IND * TARGET45;
+TABLE RESP_IND * TARGET30;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+/*         HOW WELL DOES THE MODEL DO IN THE TEST SET?             */
+/* How well does the survival model do in prediction?              */
+/* Here we could examine a number of statistics to assess          */
+/* performance, including correlations with sales and binary       */
+/* response, as well as four-fold contingency tables.              */
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+
+* gather up the cases in the test data set;
+DATA testout;
+SET outall;
+IF (SELECTED = 1) THEN DELETE;
+RUN;
+
+TITLE2 "Correlation: Predicted Time-to-Order to Actual Time-to-Order and Sales in the Test Set";
+PROC CORR DATA = testout;
+VAR PRED_TIME_TO_ORDER;
+WITH TIME_TO_ORDER GROSS_SALES_AMT;
+RUN;
+
+TITLE2 "Correlation: Time-to-Order Targets with Actual Sales Response in the Test Set";
+PROC CORR DATA = testout;
+VAR GROSS_SALES_AMT;
+WITH TARGET90 TARGET75 TARGET60 TARGET45 TARGET30;
+RUN;
+
+TITLE2 "Four-Fold Tables between Actual Binary Response and Time-to-Order Targets (Test Set)";
+* construct four-fold tables for observed and predicted values;
+* if you predict  1 (YES) and the actual response is 1 (YES) that is a correct prediction;
+* if you predict 0 (NO) and the actual response is 0 (NO) that is a correct prediction;
+* the proportion of correct predictions is a measure of predictive accuracy or fit;
+* the data for computing predictive accuracy may be obtained from four-fold tables;
+PROC FREQ DATA = testout;
+TABLE RESP_IND * TARGET90;
+TABLE RESP_IND * TARGET75;
+TABLE RESP_IND * TARGET60;
+TABLE RESP_IND * TARGET45;
+TABLE RESP_IND * TARGET30;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+TITLE2 "Baseline Sales Results from Test Set Customers with No Targeting";
+PROC MEANS DATA = testout;
+VAR GROSS_SALES_AMT;  
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+* evaluate the TARGET90 cutoff rule for targeting;
+* this rule says send the promotional mailer to anyone who has;
+* at least a ten percent chance that they will place an order; 
+* in less than 90 days;
+TITLE2 "Recommendation from Survival Data Model (TARGET90)";
+* Need to sort by TARGET before using PROC MEANS by TARGET;
+PROC SORT DATA=testout OUT=testsrt; BY TARGET90;
+
+PROC MEANS DATA = testsrt;
+VAR GROSS_SALES_AMT;  BY TARGET90;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+* evaluate the TARGET75 cutoff rule for targeting;
+* this rule says send the promotional mailer to anyone who has;
+* at least a ten percent chance that they will place an order; 
+* in less than 75 days;
+TITLE2 "Recommendation from Survival Data Model (TARGET75)";
+* Need to sort by TARGET before using PROC MEANS by TARGET;
+PROC SORT DATA=testout OUT=testsrt; BY TARGET75;
+
+PROC MEANS DATA = testsrt;
+VAR GROSS_SALES_AMT;  BY TARGET75;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+* evaluate the TARGET60 cutoff rule for targeting;
+* this rule says send the promotional mailer to anyone who has;
+* at least a ten percent chance that they will place an order; 
+* in less than 60 days;
+TITLE2 "Recommendation from Survival Data Model (TARGET60)";
+* Need to sort by TARGET before using PROC MEANS by TARGET;
+PROC SORT DATA=testout OUT=testsrt; BY TARGET60;
+
+PROC MEANS DATA = testsrt;
+VAR GROSS_SALES_AMT;  BY TARGET60;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+* evaluate the TARGET45 cutoff rule for targeting;
+* this rule says send the promotional mailer to anyone who has;
+* at least a ten percent chance that they will place an order; 
+* in less than 45 days;
+TITLE2 "Recommendation from Survival Data Model (TARGET45)";
+* Need to sort by TARGET before using PROC MEANS by TARGET;
+PROC SORT DATA=testout OUT=testsrt; BY TARGET45;
+
+PROC MEANS DATA = testsrt;
+VAR GROSS_SALES_AMT;  BY TARGET45;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+* evaluate the TARGET30 cutoff rule for targeting;
+* this rule says send the promotional mailer to anyone who has;
+* at least a ten percent chance that they will place an order; 
+* in less than 30 days;
+TITLE2 "Recommendation from Survival Data Model (TARGET30)";
+* Need to sort by TARGET before using PROC MEANS by TARGET;
+PROC SORT DATA=testout OUT=testsrt; BY TARGET30;
+
+PROC MEANS DATA = testsrt;
+VAR GROSS_SALES_AMT;  BY TARGET30;
+RUN;
+
+
+/* /////////////////////////////////////////////////////////////// */
+/* Create Dataset for Input into JMP Pro (Use First Imputattion)   */
+/* /////////////////////////////////////////////////////////////// */
+
+DATA jlearn1;
+SET midat1;
+IF(SELECTED = 0) THEN DELETE; * delete test data records;
+CENSORED = 1 - RESP_IND; * create censored data indicator for JMP Pro;
+RUN;
+
