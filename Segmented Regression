@@ -1,0 +1,1071 @@
+/* ///////////////////////////////////////////////////////////////////////// */
+/* ///////////////////////////////////////////////////////////////////////// */
+/* ///////////////////////////////////////////////////////////////////////// */
+/* ///////////////////////////////////////////////////////////////////////// */
+/* ///////////////////////////////////////////////////////////////////////// */
+/* ///////////////////////////////////////////////////////////////////////// */
+/* ///////////////////////////////////////////////////////////////////////// */
+
+TITLE "PREDICT 410-55: Building and Testing a Segmented Regression Model";
+
+/* This example solution shows how to set things up for a segmentation
+   analysis using PROC FACTOR and PROC CLUSTER.
+*/
+
+ODS GRAPHICS ON; * to get high resolution graphics output from selected PROCs;
+OPTIONS OBS = MAX; * reset option to analyze and report on all data;
+
+* Read in the demographics data without header row;
+FILENAME demo '/courses/u_northwestern.edu1/i_810095/c_3190/predict410_session1_demodat.csv'; 
+DATA demodat;
+INFILE demo DSD;
+INPUT INDIVIDUAL_ID MED_INC MED_HOME_VALUE MED_RENT MED_LENGTH_OF_RESIDENCE
+NUM_CHILD NUMB_ADLT ADVERTISING AVG_NO_OF_BANK_ACCNT OWN_HOME LOR MARRIAGE_STATUS
+INTESTEST_IN_SPORT INTEREST_IN_DIY INTEREST_IN_TRAVEL GENDER $ AGE;
+DATALINES;
+ ...
+RUN;
+
+* Read in the sales data without header row and with dates as character strings;
+FILENAME sales '/courses/u_northwestern.edu1/i_810095/c_3190/predict410_session1_salesdat.csv'; 
+DATA salesdat;
+INFILE sales DSD;
+INPUT INDIVIDUAL_ID LTD_GROSS_NUM_ORDERS LTD_GROSS_PURCHASE_AMT LTD_GROSS_PURCHASE_UNITS
+ LTD_AVG_ORDER_AMT LTD_AVG_ORDER_UNITS FIRST_PURCHASE_DATE $ FIRST_PURCHASE_AMT      
+ LAST_PURCHASE_DATE $ LAST_PURCHASE_AMT CLOSEST_STORE_DISTANCE RETAIL_DOLLARS          
+ RETAIL_ORDERS DIRECT_DOLLARS DIRECT_ORDERS GROSS_SELL_AMT GROSS_QTY RESP_IND;
+ DATALINES;
+ ...
+RUN;
+ 
+* Here we do a sort on INDIVIDUAL_ID to ensure that the datasets;
+* line up correctly for subsequent merging into the alldat dataset;
+PROC SORT DATA=demodat OUT=demosrt; BY INDIVIDUAL_ID;
+PROC SORT DATA=salesdat OUT=salessrt; BY INDIVIDUAL_ID;
+RUN;
+
+* Merge the demographics and sales data;
+DATA alldat;
+MERGE demosrt salessrt;
+BY INDIVIDUAL_ID;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+* Delete observations lacking critical date;
+* or lifetime purchase information;
+* as needed for modeling work;
+* There are not very many of these;
+DATA alldat;
+SET alldat;
+IF LAST_PURCHASE_DATE = '' THEN DELETE;
+IF FIRST_PURCHASE_DATE = '' THEN DELETE;
+
+* --------- THIS IS THE M IN RFM (possible use in survival models) ---------;
+IF LTD_AVG_ORDER_AMT = . THEN DELETE; * Monetary value type one;
+IF LTD_GROSS_PURCHASE_AMT = . THEN DELETE; * Monetary value type two;
+
+* --------- IF THE BINARY RESPONSE IS MISSING THEN DELETE -------;
+* Note. RESP_IND = 0 is indicator of censoring in survival models for TIME_TO_ORDER;
+IF RESP_IND = . THEN DELETE; 
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+* clone response variables for regression and logistic regression;
+* replace missing sales response data with zeroes;
+* and create new gender and date variables;
+DATA alldat;
+SET alldat;
+GROSS_SALES_AMT = GROSS_SELL_AMT;
+IF GROSS_SALES_AMT = . THEN GROSS_SALES_AMT = 0; 
+
+* log sales as possible response;
+LOG_GROSS_SALES_AMT = LOG(GROSS_SALES_AMT + 1); 
+
+GROSS_QUANTITY = GROSS_QTY;
+IF GROSS_QUANTITY = . THEN GROSS_QUANTITY = 0; 
+
+* Add code U for undefined to GENDER;
+IF GENDER ^in('M','F') THEN GENDER='U';
+
+* Define MALE as binary indicator variable;
+IF GENDER ='M' THEN MALE=1; ELSE MALE=0;
+
+* Define FEMALE as binary indicator variable;
+IF GENDER ='F' THEN FEMALE=1; ELSE FEMALE=0;
+
+* Create date variables for subsequent analysis;
+* Character to date format with base date January 1, 1960;
+* So XLAST_PURCHASE_DATE shows number of days since January 1, 1960;
+XLAST_PURCHASE_DATE = input(LAST_PURCHASE_DATE, mmddyy10.); 
+
+* Character to date format;
+XFIRST_PURCHASE_DATE = input(FIRST_PURCHASE_DATE, mmddyy10.); 
+
+* WORKING THE DATES ---------------------------------------------------;
+* Note that we had previously used TODAY() as a base date for computing;
+* date-defined variables like XDAYS_SINCE_LAST_PURCHASE and;
+* XDAYS_SINCE_FIRST_PURCHASE (tenure)....;
+* But TODAY() means today's date, which changes every day;
+* To provide code that yields results that are reproducible;
+* from one run to the next, we will use an imagined day of;
+* the promotion to provide the date baseline for date variables;
+* That way results will be consistent across time;
+* The idea of reproducibility of runs is one we have employed;
+* previously in setting random number generator seed values;
+* Note the following date ranges in the sample data;
+
+* A review of the sample data shows that;
+* FIRST_PURCHASE_DATE goes from 1/1/00 to 6/6/10;
+* LAST_PURCHASE_DATE goes from 8/16/03 to 12/13/10;
+
+* In the code that follows for date calculations;
+* we arbitrarily set 12/14/10 as our date for the promotion;
+* Here we define the constant variable DATE_OF_PROMOTION;
+DATE_OF_PROMOTION = '12/14/10'; * arbitrary date constant as character string;
+XDATE_OF_PROMOTION = input(DATE_OF_PROMOTION, mmddyy10.); * set character string as date type;
+
+* --------- COMPUTE THE R IN RFM ---------;
+XDAYS_SINCE_LAST_PURCHASE = XDATE_OF_PROMOTION - XLAST_PURCHASE_DATE; * Recency Variable;   
+
+* --------- COMPUTE THE F IN RFM ---------;
+XDAYS_BETWEEN_FIRST_AND_LAST = (XLAST_PURCHASE_DATE - XFIRST_PURCHASE_DATE);
+XDAYS_BETWEEN_ORDERS = XDAYS_BETWEEN_FIRST_AND_LAST/LTD_GROSS_NUM_ORDERS; * Frequency Variable;
+
+* --------- TWO POSSIBLE TENURE VARIABLES (PICK YOUR POISON) -------;
+* Tenure represents a time-defined response for survival models;
+* As set up here, these response measures have complete data;
+* That is, they have no associated censoring variable;
+* One tenure-related variable is the days since first purchase; 
+* This can be used in predictive models for sales response or;
+* binary response to the promtion;
+* Here we are assuming that all of the customers in our sample data;
+* are still our customers...  whether or not they responded to the promotion;
+XDAYS_SINCE_FIRST_PURCHASE = XDATE_OF_PROMOTION - XFIRST_PURCHASE_DATE; 
+
+* ///////////// Time-defined response variable \\\\\\\\\\\\\\;
+TENURE_PRE_PROMOTION = XDAYS_SINCE_FIRST_PURCHASE; 
+
+* Another tenure-related variable would consider the promotion response;
+* Here if someone has not responded to the promotion we consider;
+* the date of the last purchase as the the last purchase date;
+* That is, we do not assume that all of the customers in our sample data;
+* are still our customers...  if they responded to the promotion they are;
+* but if they did not respond to the promotion, we do not know;
+* if they are still our customers;
+* Note that this tenure variable cannot be used in predictive models;
+* for sales response or for binary response to the promotion;
+* because it is defined using the binary response RESP_IND itself; 
+
+YDAYS_SINCE_FIRST_PURCHASE = XDATE_OF_PROMOTION - XFIRST_PURCHASE_DATE;
+IF(RESP_IND = 0) THEN YDAYS_SINCE_FIRST_PURCHASE = XLAST_PURCHASE_DATE - XFIRST_PURCHASE_DATE;
+
+* ///////////// Time-defined response variable \\\\\\\\\\\\\\;
+TENURE_POST_PROMOTION = YDAYS_SINCE_FIRST_PURCHASE;
+
+* ----------- TIME-TO-ORDER VARIABLE (ALTERNATIVE TO TENURE) ---------;
+* This is an alternative time-defined response variable for survival models;
+* This gets at the question "when do customers order?" or, alternatively;
+* "when should we send the next promotional mailer to a customer?";
+* This is nothing more than the already computed recency variable;
+
+*   XDAYS_SINCE_LAST_PURCHASE = XDATE_OF_PROMOTION - XLAST_PURCHASE_DATE;
+
+* ///////////// Time-defined response variable \\\\\\\\\\\\\\;
+TIME_TO_ORDER = XDAYS_SINCE_LAST_PURCHASE;
+
+* With right-censoring indicated by RESP_IND = 0 for nonresponders;
+* --------------------------------------------------------------------;
+RUN;
+
+* print first 20 observations to check values of selected date variables;
+* we look at the character strings and the computed numeric date variables;
+TITLE2 "Character and Numeric Date Variables across the Entire Sample";
+OPTIONS OBS = 20;
+PROC PRINT DATA = alldat; 
+VAR INDIVIDUAL_ID RESP_IND FIRST_PURCHASE_DATE LAST_PURCHASE_DATE DATE_OF_PROMOTION
+XFIRST_PURCHASE_DATE XLAST_PURCHASE_DATE XDATE_OF_PROMOTION;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+* print first 20 observations to check values of calculated date variables;
+* we look at the character strings and the computed numeric date variables;
+TITLE2 "Numeric Computed Date Variables across the Entire Sample";
+OPTIONS OBS = 20;
+PROC PRINT DATA = alldat; 
+VAR INDIVIDUAL_ID RESP_IND XFIRST_PURCHASE_DATE XLAST_PURCHASE_DATE XDATE_OF_PROMOTION
+XDAYS_SINCE_LAST_PURCHASE XDAYS_SINCE_FIRST_PURCHASE YDAYS_SINCE_FIRST_PURCHASE;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+* print first 20 observations to check values of calculated date variables;
+* we look at the character strings and the computed numeric date variables;
+TITLE2 "Numeric Computed Frequency Variable across the Entire Sample";
+OPTIONS OBS = 20;
+PROC PRINT DATA = alldat; 
+VAR INDIVIDUAL_ID RESP_IND XFIRST_PURCHASE_DATE XLAST_PURCHASE_DATE 
+XDAYS_BETWEEN_FIRST_AND_LAST LTD_GROSS_NUM_ORDERS XDAYS_BETWEEN_ORDERS;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+* print first 20 observations to check values of calculated date variables;
+* we look at the character strings and the computed numeric date variables;
+TITLE2 "Time-Defined Response Variables for Survival Data Models";
+OPTIONS OBS = 20;
+PROC PRINT DATA = alldat; 
+VAR INDIVIDUAL_ID RESP_IND XFIRST_PURCHASE_DATE XLAST_PURCHASE_DATE 
+XDATE_OF_PROMOTION TENURE_PRE_PROMOTION TENURE_POST_PROMOTION TIME_TO_ORDER;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+/* STARTING HERE WE WILL DIVIDE OUR DATA SET INTO LEARNING/TEST    */
+/* Here we will consider the ultimate goal of predicting sales.    */
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+
+
+TITLE2 "Prepare for Dividing into Learning and Test Subsamples";
+* here we use PROC SURVEYSELECT to split the data into two subsamples;
+* simple random sampling without replacement;
+* splits full dataset into two with 6500 in learning set;
+* Setting the seed ensures reproducibility of results from;
+*   one run of this program to the next;
+* specify that all original observations will be included in splitdat;
+PROC SURVEYSELECT DATA = alldat
+METHOD = SRS 
+N = 5000 
+SEED = 77777 
+OUT = splitdat 
+OUTALL; 
+RUN;
+
+* let learning set be SELECTED = 1;
+* let test set be SELECTED = 0;
+* define test data set as having missing values;
+* new response variable SPLIT_RESPONSE;
+* is defined for working with learning and test subsamples;
+DATA splitdat;
+SET splitdat; 
+* Here we have the option of choosing whichever sales response;
+* variable we want to use as our response variable;
+* because we are renaming it as ACTUAL_RESPONSE and;
+* SPLIT_RESPONSE... for our learning and test sets;
+* for regression we had used GROSS_SALES_AMT or LOG_GROSS_SALES_AMT;
+* for logistic regression we use the binary response RESP_IND;
+ACTUAL_RESPONSE = LOG_GROSS_SALES_AMT;
+SPLIT_RESPONSE = LOG_GROSS_SALES_AMT;
+IF SELECTED = 0 THEN SPLIT_RESPONSE = .; * for the test set;
+RUN;
+
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+TITLE2 "Multiple Imputation after Learning/Test Setup";
+* Define set of explanatory variables for use in multiple imputation;
+* Though not needed for the RFM model many of these may be useful later;
+* In developing survival models for tenure, for example, we may want to;
+* use demographic variables that have missing data;
+
+%let MI_VARIABLES =
+MED_INC 
+MED_HOME_VALUE 
+MED_RENT 
+MED_LENGTH_OF_RESIDENCE
+NUM_CHILD 
+NUMB_ADLT  
+AVG_NO_OF_BANK_ACCNT  
+LOR 
+AGE;
+        
+/* Note. Categorical demographic variables omitted from multiple imputation.
+         With the definition of level U for GENDER, these have complete data 
+         in this case: 
+         
+         MALE 
+         FEMALE 
+         OWN_HOME 
+         MARRIAGE_STATUS. 
+         
+        Note that PROC MI has a CLASS method for imputing categorical variables
+        when that sort of need arises. Here it is not needed.
+        
+        Non-demographic variables omitted from the multiple imputation 
+        list this time around because we will be using demographic variables
+        as the basis for defining our segments:
+        
+INTESTEST_IN_SPORT 
+INTEREST_IN_DIY 
+INTEREST_IN_TRAVEL 
+ADVERTISING
+   LTD_GROSS_NUM_ORDERS 
+LTD_GROSS_PURCHASE_AMT 
+LTD_GROSS_PURCHASE_UNITS
+LTD_AVG_ORDER_AMT 
+LTD_AVG_ORDER_UNITS  
+FIRST_PURCHASE_AMT      
+LAST_PURCHASE_AMT 
+CLOSEST_STORE_DISTANCE 
+RETAIL_DOLLARS          
+RETAIL_ORDERS DIRECT_DOLLARS 
+DIRECT_ORDERS
+XLAST_PURCHASE_DATE
+XFIRST_PURCHASE_DATE
+XDAYS_SINCE_LAST_PURCHASE
+XDAYS_SINCE_FIRST_PURCHASE
+XDAYS_BETWEEN_ORDERS 
+*/
+
+* Multiple imputation across the demographic variable set;
+* If there are missing data on any of these variables;
+* replacement data values will be obtained from a;
+* multiple regression model utilizing all demographic variables;
+* Setting the seed ensures reproducibility of results from;
+*   one run of this program to the next;
+TITLE2 "Multiple Imputations Prior to Survival Data Analysis";
+PROC MI DATA = splitdat seed=77777 out = midat;
+MCMC;
+VAR &MI_VARIABLES;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/*  SET UP GENDER_CLASS AS CLASS VARIABLE CODED 1/2/3 FOR M/F/U    */
+/*  NEEDED FOR CATEGORICAL EXPLANATORY VARIABLE EFFECT TESTS       */
+/*  This will give us three separate ways of specifying gender     */
+/*        (1) GENDER character data M/F/U                          */
+/*        (2) MALE and FEMALE binary indicators                    */
+/*        (3) GENDER_CLASS 1/2/3 FOR M/F/U                         */
+/*  We may use this... and then again we may not.                  */
+/* /////////////////////////////////////////////////////////////// */
+DATA midat;
+SET midat;
+GENDER_CLASS = 1;
+IF(FEMALE = 1) THEN GENDER_CLASS = 2;
+IF(MALE = 0 AND FEMALE = 0) THEN GENDER_CLASS = 3;
+RUN;
+
+* show contents of the full data set prior to splitting;
+TITLE2 "Contents of the Multiple Imputation Data Set (5 Imputations)";
+PROC CONTENTS DATA = midat;
+RUN;
+
+
+* provide a short listing of variable values to check the data;
+OPTIONS OBS = 4;
+PROC PRINT DATA = midat; 
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+/* //////////////////////////////////////////////////////////////// */
+/*          SET UP FIVE MULTIPLE IMPUTATION DATA SETS               */
+/*                                                                  */
+/* Note that we will set up separate datasets explicity to walk     */
+/* through the process of implementing multiple imputation in       */
+/* obtaining trustworthy predictions. Some SAS modeling procedures  */
+/* offer a command structure to automate the process. Look for      */
+/*                                                                  */
+/*                      by _Imputation_;                             */
+/*                                                                  */
+/* Documentation for SAS multiple imputation may be found at        */
+/* http://support.sas.com/rnd/app/papers/multipleimputation.pdf     */
+/*                                                                  */
+/* //////////////////////////////////////////////////////////////// */
+/* For our learning and test set work we choose  
+   instances of the multiple imputation datasets.
+   We prepare all five imputations for our survival modeling */
+DATA midat1;
+SET midat;
+IF(_Imputation_ ^= 1) THEN DELETE;
+RUN;
+
+DATA midat2;
+SET midat;
+IF(_Imputation_ ^= 2) THEN DELETE;
+RUN;
+
+DATA midat3;
+SET midat;
+IF(_Imputation_ ^= 3) THEN DELETE;
+RUN;
+
+DATA midat4;
+SET midat;
+IF(_Imputation_ ^= 4) THEN DELETE;
+RUN;
+
+DATA midat5;
+SET midat;
+IF(_Imputation_ ^= 5) THEN DELETE;
+RUN;
+
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+
+/* /////////////////////////////////////////////////////////////// */
+/* SET UP NAMED EXPLANATORY VARIABLE SET FOR PREDICTIVE MODELING   */
+/* Here we return to our original RFM regression model using       */
+/* data from just the first multiple imputation for demonstration. */
+/*                                                                 */
+/*     RFM stands for recency, frequency, and monetary value.      */ 
+/*                                                                 */    
+/* Recency refers to how recently the customer purchased an item.  */
+/* We use XDAYS_SINCE_LAST_PURCHASE for recency.                   */
+/*                                                                 */     
+/* Frequency refers to how often the customer purchases.           */
+/*   We use XDAYS_BETWEEN_ORDERS as an indicator of infrequency.   */
+/*                                                                 */     
+/* Monetary value refers to how much the customer spends.          */
+/* Regarding monetary value, we might consider the average spend   */
+/* on an order or the total spend across time, or both.            */   
+/* We use two variables for mondetary value:                       */
+/* LTD_AVG_ORDER_AMT and LTD_GROSS_PURCHASE_AMT                    */
+/*                                                                 */   
+/* /////////////////////////////////////////////////////////////// */   
+%let RFM_VARIABLES =
+XDAYS_SINCE_LAST_PURCHASE
+XDAYS_BETWEEN_ORDERS
+LTD_AVG_ORDER_AMT
+LTD_GROSS_PURCHASE_AMT; 
+/* /////////////////////////////////////////////////////////////// */
+
+
+
+/* /////////////////////////////////////////////////////////////////// */
+/*        MULTIPLE REGRESSION MODEL FIT TO FIRST IMPUTATION            */
+/* This is the baseline model for testing the utility of segmentation. */
+/* /////////////////////////////////////////////////////////////////// */
+TITLE2 "Baseline Regression Model without Segmentation (First Imputation)";
+
+* we fit a regression model to the learning set as in previous regression models; 
+* obtain predicted response values for learning and test sets in one PROC REG;
+TITLE2 "Fitting an RFM Regression Model to the Learning Data";
+ODS GRAPHICS ON;  * turn on high-resolution graphics;
+PROC REG DATA = midat1; 
+/* --------------------------------------------------------------- */
+* THIS IS THE MODEL BEING EVALUATED.... PUT YOUR FINAL MODEL HERE;
+* This particular example is like an RFM model for direct marketing;
+MODEL SPLIT_RESPONSE = &RFM_VARIABLES/ TOL VIF; 
+/* --------------------------------------------------------------- */
+OUTPUT OUT = allout PREDICTED = RFM_PRED; * save predicted response values;
+RUN;
+
+* Add baseline RFM regression model results to the allout dataset;
+DATA allout;
+SET allout;
+RFM_RESIDUAL = ACTUAL_RESPONSE - RFM_PRED; * residual;
+RFM_ABS_RESIDUAL = abs(RFM_RESIDUAL); * absolute value of the residual;
+RFM_PRED_GROSS_SALES_AMT = MAX(0,EXP(RFM_PRED) -1); * exp inverse function of log;
+* Promotional targeting variable for a $2 mailing;
+IF(RFM_PRED_GROSS_SALES_AMT > 2) THEN RFM_TARGET2 = 1; ELSE RFM_TARGET2 = 0;
+RUN;
+
+* print first 20 observations to check values of observed and predicted sales;
+OPTIONS OBS = 20;
+PROC PRINT DATA = allout; 
+VAR INDIVIDUAL_ID SELECTED ACTUAL_RESPONSE RFM_PRED RFM_RESIDUAL RFM_ABS_RESIDUAL;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+
+* define the learning set;
+DATA learnout;
+SET allout;
+if SELECTED = 0 THEN DELETE;
+RUN;
+* show contents of the learning dataset;
+TITLE2 "Contents of the Learning Dataset with RFM Predictions";
+PROC CONTENTS DATA = learnout;
+RUN;
+
+* define the test set;
+DATA testout;
+SET allout;
+if SELECTED = 1 THEN DELETE;
+RUN;
+* show contents of the test dataset;
+TITLE2 "Contents of the Test Dataset with RFM Predictions";
+PROC CONTENTS DATA = learnout;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+TITLE2 "Learning Set Results for the Baseline RFM Regression Model without Segmentation";
+
+* summary statistics root mean-squared error and mean absolute error;
+* RMSE will be the standard deviation of RFM_RESIDUAL;
+* MAE will be the mean of ABS_RESIDUAL;
+PROC UNIVARIATE DATA = learnout;
+VAR RFM_RESIDUAL RFM_ABS_RESIDUAL;
+RUN;
+
+* the square of the correlation between observed and predicted sales;
+* is equal to R2 from the regression model;
+PROC CORR DATA = learnout PLOTS = SCATTER;
+VAR ACTUAL_RESPONSE; 
+WITH RFM_PRED;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+TITLE2 "Test Set Results for the Baseline RFM Regression Model without Segmentation";
+
+* summary statistics root mean-squared error and mean absolute error ;
+* RMSE will be the standard deviation of RESIDUAL;
+* MAE will be the mean of ABS_RESIDUAL;
+PROC UNIVARIATE DATA = testout;
+VAR RFM_RESIDUAL RFM_ABS_RESIDUAL;
+RUN;
+
+* the square of the correlation between observed and predicted sales;
+* for the test set is likely to be less than the R2 from the;
+* regression model fit to the learning set;
+PROC CORR DATA = testout PLOTS = SCATTER;
+VAR ACTUAL_RESPONSE;
+WITH RFM_PRED;
+RUN;
+
+/* ////////////////////////////////////////////////////////////////// */
+/* ////////////////////////////////////////////////////////////////// */
+/* Test set assessment of the baseline RFM model without segmentation */
+/* ////////////////////////////////////////////////////////////////// */
+/* ////////////////////////////////////////////////////////////////// */
+
+TITLE2 "Test Set Recommendations from Baseline RFM Model ($2 Mailing Target)";
+* print first 20 observations to check values of observed and predicted sales;
+OPTIONS OBS = 20;
+PROC PRINT DATA = testout; 
+VAR INDIVIDUAL_ID XDAYS_SINCE_LAST_PURCHASE XDAYS_BETWEEN_ORDERS LTD_AVG_ORDER_AMT LTD_GROSS_PURCHASE_AMT GROSS_SALES_AMT RFM_PRED_GROSS_SALES_AMT RFM_TARGET2;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+TITLE2 "Baseline Sales Results from Test Set Customers with No Targeting";
+PROC MEANS DATA = testout;
+VAR GROSS_SALES_AMT;  
+RUN;
+
+TITLE2 "Recommendation from Baseline RFM Model (Send $2 Direct Mail if RFM_TARGET2 = 1)";
+* Need to sort by TARGET before using PROC MEANS by TARGET;
+PROC SORT DATA=testout OUT=testsrt; BY RFM_TARGET2;
+PROC MEANS DATA = testsrt;
+VAR GROSS_SALES_AMT;  BY RFM_TARGET2;
+RUN;
+
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* SEGMENTATION WORK...  using PROC FACTOR and PROC CLUSTER            */
+/* For the demonstration we will use data from the first imputation.   */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+
+TITLE2 "Principal Components Analysis (First Imputation)";
+
+* Define set of demographic input variables to segmentation;
+%let SEG_INPUT_VARIABLES =
+MED_INC 
+MED_HOME_VALUE 
+MED_RENT 
+MED_LENGTH_OF_RESIDENCE
+NUM_CHILD 
+NUMB_ADLT  
+AVG_NO_OF_BANK_ACCNT  
+LOR 
+AGE    
+MALE 
+FEMALE 
+OWN_HOME
+MARRIAGE_STATUS;
+
+/* We will perform principal components analysis, extracting the             */
+/* first five principal components from the demographic input variables.     */
+/* We will extract the complete set of factors, using PROC FACTOR            */
+/* for variable-standardizing rather than dimension reduction.               */
+/* Use SCREE to print of scree plot to judge number of components to extract */
+/* If we were using this procedure to identify underlying dimensions         */
+/* we would extract fewer factors and rotate using ROTATE = VARIMAX          */ 
+/* For SAS documentation on scoring of this type see the following:          */
+/*
+http://support.sas.com/documentation/cdl/en/statug/63347/HTML/default/viewer.htm#statug_score_sect005.htm
+*/
+
+PROC FACTOR DATA = midat1 /* use first imputation data */
+RANDOM = 9999 /* seed for reproducible results (not needed here) */
+MAXITER = 100 /* maximum number of iterations (not needed here) */
+METHOD = PRINCIPAL /* method of extraction will be principal components */
+NFACTORS = 13 /* number of factors to retain */
+SCORE /* obtain standardized scoring coefficients */
+OUTSTAT = fscore1; /* save scoring dataset for use in PROC SCORE */
+VAR &SEG_INPUT_VARIABLES; /* variables included in principal components analysis*/
+RUN;
+
+* show contents of the factor score dataset;
+TITLE2 "Contents of the Factor Scoring Dataset (First Imputation)";
+PROC CONTENTS DATA = fscore1;
+RUN;
+
+* print the factor scoring dataset to see what it contains;
+PROC PRINT DATA = fscore1; 
+RUN;
+
+* Input the original data and factor scoring dataset to get factor scores;
+* Dataset name fsmidat1 refers to factor scored first multiple imputation;
+* Note that dataset naming is a crazy 8-character limited thing;
+PROC SCORE DATA = midat1 SCORE = fscore1 OUT = fsmidat1; 
+RUN;
+
+* show contents of the new dataset including factor scores;
+TITLE2 "Contents of the Factor Score Dataset (First Imputation)";
+PROC CONTENTS DATA = fsmidat1;
+RUN;
+
+* Name the set of principal component scores;
+%let FACTOR_SCORES =
+Factor1
+Factor2
+Factor3
+Factor4
+Factor5
+Factor6
+Factor7
+Factor8
+Factor9
+Factor10
+Factor11
+Factor12
+Factor13;
+
+* Demonstrate that principal component scores are indeed standardized;
+* and that principal component scores are indeed uncorrelated;
+PROC CORR DATA = fsmidat1; 
+VAR &FACTOR_SCORES;
+RUN;
+    
+* Demonstrate that principal component scores are better conditioned;
+* That is, they have better statistical properties than the initial;
+* demographic variables. So they will work better as input to PROC CLUSTER;
+* here we take a couple variables to demonstrate this fact;
+
+/* SAS reference for obtaining kernel density estimates
+http://support.sas.com/documentation/cdl/en/procstat/63104/HTML/default/viewer.htm#procstat_univariate_sect078.htm
+*/
+
+PROC UNIVARIATE DATA = fsmidat1 NOPRINT;
+HISTOGRAM &SEG_INPUT_VARIABLES &FACTOR_SCORES/ KERNEL(C = 0.50 L = 1  NOPRINT);
+RUN;                           
+
+* A review of the output from PROC FACTOR as well as the principal;
+* component score kernel densities suggests that the first four components;
+* may be a good set of inputs to cluster analysis procedures for segmentation;
+* Note that analyst judgment is key here... there are no hard-and-fast rules;
+/* For SAS documentation on clustering procedures see
+http://support.sas.com/documentation/cdl/en/statugclustering/61759/PDF/default/statugclustering.pdf
+*/
+
+* How many clusters to extract? This can be a hard question to answer;
+* We are going to cheat here a little and ask for just two;
+* This makes things easier going forward... no need to define binary indicators;
+* as needed for multi-category explanatory variables in PROC REG;
+TITLE2 "K-Means Cluster Analysis with Principal Component Score Input (First Imputation)";
+PROC FASTCLUS DATA = fsmidat1 OUT = fsc1 MAXCLUSTERS = 2 NOPRINT;
+VAR Factor1
+Factor2
+Factor3
+Factor4;
+RUN;
+
+* show contents of the new dataset including factor scores and clusters/segments;
+PROC CONTENTS DATA = fsc1;
+RUN;
+
+TITLE2 "Examining the Two-Cluster Solution (First Imputation)";
+PROC SORT DATA=fsc1 OUT=fsc1srt; BY CLUSTER;
+PROC MEANS DATA = fsc1srt;
+VAR GROSS_SALES_AMT &SEG_INPUT_VARIABLES;  BY CLUSTER;
+RUN;
+
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* RFM CLUSTER MODEL.... PRELIMINARY TO RFM SEGMENTED REGRESSION MODEL */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/*        MULTIPLE REGRESSION MODEL FIT TO FIRST IMPUTATION            */
+/*     Adding cluster segment to the model as a class variable.        */
+/* Note that this is not yet a segmented regression model              */
+/* /////////////////////////////////////////////////////////////////// */
+TITLE2 "Regression Adding CLUSTER as Binary Explanatory Variable (First Imputation)";
+
+%let RFM_CLUS_VARIABLES =
+XDAYS_SINCE_LAST_PURCHASE
+XDAYS_BETWEEN_ORDERS
+LTD_AVG_ORDER_AMT
+LTD_GROSS_PURCHASE_AMT
+CLUSTER; /* note that here we have a two-level CLUSTER */
+
+* we fit a regression model to the learning set as in previous regression models; 
+* obtain predicted response values for learning and test sets in one PROC REG;
+* Curiously, PROC REG does not have support a CLASS statement for;
+* multi-category explanatory variables... so if more than two clusters;
+* are utilized, we would need to define a set of indicator variables;
+* A K-category explanatory variable requires K-1 binary indicator variables;
+TITLE2 "Fitting an RFM Cluster Regression Model to the Learning Data";
+ODS GRAPHICS ON;  * turn on high-resolution graphics;
+PROC REG DATA = fsc1; 
+/* --------------------------------------------------------------- */
+* THIS IS THE MODEL BEING EVALUATED.... PUT YOUR FINAL MODEL HERE;
+* This particular example is like an RFM model for direct marketing;
+MODEL SPLIT_RESPONSE = &RFM_CLUS_VARIABLES/ TOL VIF; 
+/* --------------------------------------------------------------- */
+OUTPUT OUT = clusout1 PREDICTED = RFM_CLUS_PRED; * save predicted response values;
+RUN;
+
+* Add RFM cluster regression model results to the clusout1 dataset;
+DATA clusout1;
+SET clusout1;
+RFM_CLUS_RESIDUAL = ACTUAL_RESPONSE - RFM_CLUS_PRED; * residual;
+RFM_CLUS_ABS_RESIDUAL = abs(RFM_CLUS_RESIDUAL); * absolute value of the residual;
+RFM_CLUS_PRED_GROSS_SALES_AMT = MAX(0,EXP(RFM_CLUS_PRED) -1); * exp inverse function of log;
+* Promotional targeting variable for a $2 mailing;
+IF(RFM_CLUS_PRED_GROSS_SALES_AMT > 2) THEN RFM_CLUS_TARGET2 = 1; ELSE RFM_CLUS_TARGET2 = 0;
+RUN;
+
+* check contents from the RFM cluster model;
+PROC CONTENTS DATA = clusout1;
+RUN;
+
+* print first 20 observations to check values of observed and predicted sales;
+OPTIONS OBS = 20;
+PROC PRINT DATA = clusout1; 
+VAR INDIVIDUAL_ID SELECTED ACTUAL_RESPONSE RFM_CLUS_PRED RFM_CLUS_RESIDUAL RFM_CLUS_ABS_RESIDUAL;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+
+* define the learning set;
+DATA learnout;
+SET clusout1;
+if SELECTED = 0 THEN DELETE;
+RUN;
+* show contents of the learning dataset;
+TITLE2 "Contents of the Learning Dataset with RFM Cluster Predictions";
+PROC CONTENTS DATA = learnout;
+RUN;
+
+* define the test set;
+DATA testout;
+SET clusout1;
+if SELECTED = 1 THEN DELETE;
+RUN;
+* show contents of the test dataset;
+TITLE2 "Contents of the Test Dataset with RFM Cluster Predictions";
+PROC CONTENTS DATA = learnout;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+TITLE2 "Learning Set Results for the RFM Cluster Regression Model";
+
+* summary statistics root mean-squared error and mean absolute error;
+* RMSE will be the standard deviation of RFM_CLUS_RESIDUAL;
+* MAE will be the mean of ABS_RESIDUAL;
+PROC UNIVARIATE DATA = learnout;
+VAR RFM_CLUS_RESIDUAL RFM_CLUS_ABS_RESIDUAL;
+RUN;
+
+* the square of the correlation between observed and predicted sales;
+* is equal to R2 from the regression model;
+PROC CORR DATA = learnout PLOTS = SCATTER;
+VAR ACTUAL_RESPONSE; 
+WITH RFM_CLUS_PRED;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+TITLE2 "Test Set Results for the RFM Cluster Regression Model";
+
+* summary statistics root mean-squared error and mean absolute error ;
+* RMSE will be the standard deviation of RESIDUAL;
+* MAE will be the mean of ABS_RESIDUAL;
+PROC UNIVARIATE DATA = testout;
+VAR RFM_CLUS_RESIDUAL RFM_CLUS_ABS_RESIDUAL;
+RUN;
+
+* the square of the correlation between observed and predicted sales;
+* for the test set is likely to be less than the R2 from the;
+* regression model fit to the learning set;
+PROC CORR DATA = testout PLOTS = SCATTER;
+VAR ACTUAL_RESPONSE;
+WITH RFM_CLUS_PRED;
+RUN;
+
+/* ////////////////////////////////////////////////////////////////// */
+/* ////////////////////////////////////////////////////////////////// */
+/* Test set assessment of the RFM cluster model                       */
+/* ////////////////////////////////////////////////////////////////// */
+/* ////////////////////////////////////////////////////////////////// */
+
+TITLE2 "Test Set Recommendations from RFM Cluster Model ($2 Mailing Target)";
+* print first 20 observations to check values of observed and predicted sales;
+OPTIONS OBS = 20;
+PROC PRINT DATA = testout; 
+VAR INDIVIDUAL_ID XDAYS_SINCE_LAST_PURCHASE XDAYS_BETWEEN_ORDERS LTD_AVG_ORDER_AMT LTD_GROSS_PURCHASE_AMT GROSS_SALES_AMT RFM_CLUS_PRED_GROSS_SALES_AMT RFM_CLUS_TARGET2;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+TITLE2 "Sales Results from Test Set Customers with No Targeting";
+PROC MEANS DATA = testout;
+VAR GROSS_SALES_AMT;  
+RUN;
+
+TITLE2 "Recommendation from RFM Cluster Model (Send $2 Direct Mail if RFM_CLUS_TARGET2 = 1)";
+* Need to sort by TARGET before using PROC MEANS by TARGET;
+PROC SORT DATA=testout OUT=testsrt; BY RFM_CLUS_TARGET2;
+PROC MEANS DATA = testsrt;
+VAR GROSS_SALES_AMT;  BY RFM_CLUS_TARGET2;
+RUN;
+
+
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+
+
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/*                    RFM SEGMENTED REGRESSION MODEL                   */
+/* /////////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////////// */
+/*        MULTIPLE REGRESSION MODEL FIT TO FIRST IMPUTATION            */
+/*     Use cluster segment as a way to divide the input data.          */
+/* Division of the data is carried out for both learn and test sets.   */
+/*                                                                     */
+/* Note that the term "segmented regression" is often used to refer    */
+/* to piecewise linear regression. This is not what we are doing here  */
+/* Instead, we are fitting a distince regression model to each         */
+/* segment, with the segments being identified with clusters.          */
+/*                                                                     */
+/* /////////////////////////////////////////////////////////////////// */
+
+
+* Explanatory variables will be identical with the baseline RFM model;
+
+/* /////////////////////////////////////////////////////////////////// */
+/* FIT MODEL TO DATA FOR CUSTOMERS IN THE FIRST CLUSTER/SEGMENT        */
+/* /////////////////////////////////////////////////////////////////// */
+
+* partition the data into two separate datasets;
+DATA fsc1p1;
+set fsc1;
+IF CLUSTER = 2 THEN DELETE;
+RUN;
+
+DATA fsc1p2;
+set fsc1;
+IF CLUSTER = 1 THEN DELETE;
+RUN;
+
+TITLE2 "RFM Regression Model Fit to First Segment (First Imputation)";
+* FIT RFM MODEL TO THE FIRST CLUSTER/SEGMENT;
+* we fit a regression model to the learning set as in previous regression models; 
+* obtain predicted response values for learning and test sets in one PROC REG;
+* Curiously, PROC REG does not have support a CLASS statement for;
+* multi-category explanatory variables... so if more than two clusters;
+* are utilized, we would need to define a set of indicator variables;
+* A K-category explanatory variable requires K-1 binary indicator variables;
+TITLE2 "Fitting an RFM Segment Regression Model to the Learning Data";
+ODS GRAPHICS ON;  * turn on high-resolution graphics;
+PROC REG DATA = fsc1p1; 
+/* --------------------------------------------------------------- */
+* THIS IS THE MODEL BEING EVALUATED.... PUT YOUR FINAL MODEL HERE;
+* This particular example is like an RFM model for direct marketing;
+MODEL SPLIT_RESPONSE = &RFM_VARIABLES/ TOL VIF; 
+/* --------------------------------------------------------------- */
+OUTPUT OUT = segout11 PREDICTED = RFM_SEG_PRED; * save predicted response values;
+RUN;
+
+* Add RFM segment regression model results to the segout1 dataset;
+DATA segout11;
+SET segout11;
+RFM_SEG_RESIDUAL = ACTUAL_RESPONSE - RFM_SEG_PRED; * residual;
+RFM_SEG_ABS_RESIDUAL = abs(RFM_SEG_RESIDUAL); * absolute value of the residual;
+RFM_SEG_PRED_GROSS_SALES_AMT = MAX(0,EXP(RFM_SEG_PRED) -1); * exp inverse function of log;
+* Promotional targeting variable for a $2 mailing;
+IF(RFM_SEG_PRED_GROSS_SALES_AMT > 2) THEN RFM_SEG_TARGET2 = 1; ELSE RFM_SEG_TARGET2 = 0;
+RUN;
+
+TITLE2 "Contents of Dataset from RFM Regression for First Segment (First Imputation)";
+PROC CONTENTS DATA = segout11;
+RUN;
+
+TITLE2 "RFM Regression Model Fit to Second Segment (First Imputation)";
+* FIT RFM MODEL TO THE SECOND CLUSTER/SEGMENT;
+* we fit a regression model to the learning set as in previous regression models; 
+* obtain predicted response values for learning and test sets in one PROC REG;
+* Curiously, PROC REG does not have support a CLASS statement for;
+* multi-category explanatory variables... so if more than two clusters;
+* are utilized, we would need to define a set of indicator variables;
+* A K-category explanatory variable requires K-1 binary indicator variables;
+TITLE2 "Fitting an RFM Segment Regression Model to the Learning Data";
+ODS GRAPHICS ON;  * turn on high-resolution graphics;
+PROC REG DATA = fsc1p2; 
+/* --------------------------------------------------------------- */
+* THIS IS THE MODEL BEING EVALUATED.... PUT YOUR FINAL MODEL HERE;
+* This particular example is like an RFM model for direct marketing;
+MODEL SPLIT_RESPONSE = &RFM_VARIABLES/ TOL VIF; 
+/* --------------------------------------------------------------- */
+OUTPUT OUT = segout12 PREDICTED = RFM_SEG_PRED; * save predicted response values;
+RUN;
+
+* Add RFM segment regression model results to the segout1 dataset;
+DATA segout12;
+SET segout12;
+RFM_SEG_RESIDUAL = ACTUAL_RESPONSE - RFM_SEG_PRED; * residual;
+RFM_SEG_ABS_RESIDUAL = abs(RFM_SEG_RESIDUAL); * absolute value of the residual;
+RFM_SEG_PRED_GROSS_SALES_AMT = MAX(0,EXP(RFM_SEG_PRED) -1); * exp inverse function of log;
+* Promotional targeting variable for a $2 mailing;
+IF(RFM_SEG_PRED_GROSS_SALES_AMT > 2) THEN RFM_SEG_TARGET2 = 1; ELSE RFM_SEG_TARGET2 = 0;
+RUN;
+
+TITLE2 "Contents of Dataset from RFM Regression for Second Segment (First Imputation)";
+PROC CONTENTS DATA = segout12;
+RUN;
+
+* JOIN DATASETS FOR THE SEGMENTS BACK TOGETHER AGAIN;
+* Note that these two datasets have the same variable names;
+DATA segout1;
+SET segout11 segout12; * SET statement stacks the datasets one on the top of other;
+RUN;
+
+
+TITLE2 "Contents of Dataset from Complete RFM Segmented Regression (First Imputation)";
+PROC CONTENTS DATA = segout1;
+RUN;
+
+* print first 20 observations to check values of observed and predicted sales;
+OPTIONS OBS = 20;
+PROC PRINT DATA = segout1; 
+VAR INDIVIDUAL_ID SELECTED ACTUAL_RESPONSE RFM_SEG_PRED RFM_SEG_RESIDUAL RFM_SEG_ABS_RESIDUAL;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+
+* define the learning set;
+DATA learnout;
+SET segout1;
+if SELECTED = 0 THEN DELETE;
+RUN;
+* show contents of the learning dataset;
+TITLE2 "Contents of the Learning Dataset with RFM Segment Predictions";
+PROC CONTENTS DATA = learnout;
+RUN;
+
+* define the test set;
+DATA testout;
+SET segout1;
+if SELECTED = 1 THEN DELETE;
+RUN;
+* show contents of the test dataset;
+TITLE2 "Contents of the Test Dataset with RFM Segment Predictions";
+PROC CONTENTS DATA = learnout;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+TITLE2 "Learning Set Results for the RFM Segmented Regression Model";
+
+* summary statistics root mean-squared error and mean absolute error;
+* RMSE will be the standard deviation of RFM_SEG_RESIDUAL;
+* MAE will be the mean of ABS_RESIDUAL;
+PROC UNIVARIATE DATA = learnout;
+VAR RFM_SEG_RESIDUAL RFM_SEG_ABS_RESIDUAL;
+RUN;
+
+* the square of the correlation between observed and predicted sales;
+* is equal to R2 from the regression model;
+PROC CORR DATA = learnout PLOTS = SCATTER;
+VAR ACTUAL_RESPONSE; 
+WITH RFM_SEG_PRED;
+RUN;
+
+/* /////////////////////////////////////////////////////////////// */
+/* /////////////////////////////////////////////////////////////// */
+TITLE2 "Test Set Results for the RFM Segmented Regression Model";
+
+* summary statistics root mean-squared error and mean absolute error ;
+* RMSE will be the standard deviation of RESIDUAL;
+* MAE will be the mean of ABS_RESIDUAL;
+PROC UNIVARIATE DATA = testout;
+VAR RFM_SEG_RESIDUAL RFM_SEG_ABS_RESIDUAL;
+RUN;
+
+* the square of the correlation between observed and predicted sales;
+* for the test set is likely to be less than the R2 from the;
+* regression model fit to the learning set;
+PROC CORR DATA = testout PLOTS = SCATTER;
+VAR ACTUAL_RESPONSE;
+WITH RFM_SEG_PRED;
+RUN;
+
+/* ////////////////////////////////////////////////////////////////// */
+/* ////////////////////////////////////////////////////////////////// */
+/* Test set assessment of the baseline RFM segmented regression model */
+/* ////////////////////////////////////////////////////////////////// */
+/* ////////////////////////////////////////////////////////////////// */
+
+TITLE2 "Test Set Recommendations from RFM Segmented Regression Model ($2 Mailing Target)";
+* print first 20 observations to check values of observed and predicted sales;
+OPTIONS OBS = 20;
+PROC PRINT DATA = testout; 
+VAR INDIVIDUAL_ID XDAYS_SINCE_LAST_PURCHASE XDAYS_BETWEEN_ORDERS LTD_AVG_ORDER_AMT LTD_GROSS_PURCHASE_AMT GROSS_SALES_AMT RFM_SEG_PRED_GROSS_SALES_AMT RFM_SEG_TARGET2;
+RUN;
+OPTIONS OBS = MAX; * reset options to analyze and report on all data;
+
+TITLE2 "Sales Results from Test Set Customers with No Targeting";
+PROC MEANS DATA = testout;
+VAR GROSS_SALES_AMT;  
+RUN;
+
+TITLE2 "Recommendation from RFM Segmented Regression Model (Send $2 Direct Mail if RFM_SEG_TARGET2 = 1)";
+* Need to sort by TARGET before using PROC MEANS by TARGET;
+PROC SORT DATA=testout OUT=testsrt; BY RFM_SEG_TARGET2;
+PROC MEANS DATA = testsrt;
+VAR GROSS_SALES_AMT;  BY RFM_SEG_TARGET2;
+RUN;
+
